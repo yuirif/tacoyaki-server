@@ -1,0 +1,7 @@
+<!doctype html>
+<!-- 유튜브 BGM 호스트 페이지(웹판) — 렌더러가 숨김 iframe 으로 올리고 postMessage 로 재생/볼륨/반복을 제어한다.
+     ⚠ 제어 스크립트는 반드시 외부 파일(yt.js)로 둔다 — 웹판 문서 CSP 가 script-src 'self' 라 인라인은 차단된다.
+     ⚠ 설치판 짝: src/main/index.ts 의 YT_HOST_HTML — 스크립트를 고치면 yt.js 와 함께 갱신할 것. -->
+<html lang="ko"><head><meta charset="utf-8"><title>bgm</title></head>
+<body style="margin:0;background:#000;overflow:hidden"><div id="p"></div>
+<script src="yt.js"></script></body></html>
