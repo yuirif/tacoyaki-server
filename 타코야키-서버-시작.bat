@@ -6,6 +6,11 @@ echo ====================================
 echo    Tacoyaki Box - Server Launcher
 echo ====================================
 echo.
+echo  This launcher runs the server on THIS PC.
+echo  If you already made a cloud (Railway) server, close this
+echo  window - you do not need this file.
+echo  This is NOT the Tacoyaki Box app.
+echo.
 
 where node >nul 2>nul
 if errorlevel 1 goto NO_NODE
@@ -22,7 +27,13 @@ if not exist cloudflared.exe goto GET_TUNNEL
 goto RUN
 :GET_TUNNEL
 echo [*] Downloading the tunnel tool (one time only)...
-powershell -Command "try { Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile 'cloudflared.exe' } catch { exit 1 }"
+where curl.exe >nul 2>nul
+if errorlevel 1 goto GET_TUNNEL_PS
+curl.exe -L --fail -o cloudflared.exe "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+if not errorlevel 1 if exist cloudflared.exe goto RUN
+if exist cloudflared.exe del cloudflared.exe >nul 2>nul
+:GET_TUNNEL_PS
+powershell -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile 'cloudflared.exe' -UseBasicParsing } catch { Remove-Item -LiteralPath 'cloudflared.exe' -ErrorAction SilentlyContinue; exit 1 }"
 if not exist cloudflared.exe goto TUNNEL_FAIL
 :RUN
 
