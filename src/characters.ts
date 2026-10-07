@@ -46,7 +46,7 @@ export function createCharacterStore(opts?: { dataDir?: string; persist?: boolea
           }
         }
       } catch (e) {
-        console.error(`[characters] ${accountId} 로드 실패 — 빈 목록으로 시작:`, e)
+        console.error(`[characters] ${accountId} 로드 실패. 빈 목록으로 시작:`, e)
       }
     }
     cache.set(accountId, m)

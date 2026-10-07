@@ -163,7 +163,12 @@ export interface DottownStore {
     message: string
   ): { ok: boolean; guestbook?: RoomGuestEntry[]; error?: string }
   /** 방명록 삭제(방 주인 또는 작성자만). */
-  removeGuest(ownerId: string, requesterId: string, entryId: string): { ok: boolean; guestbook?: RoomGuestEntry[]; error?: string }
+  /** 방명록 글 삭제(방 주인 또는 작성자). removed=실제로 지웠는지 — 아무것도 안 지운 요청까지 방송하지 않기 위해. */
+  removeGuest(
+    ownerId: string,
+    requesterId: string,
+    entryId: string
+  ): { ok: boolean; guestbook?: RoomGuestEntry[]; removed?: boolean; error?: string }
   /** 인기 마이룸 랭킹(좋아요 우선, 방문수 차순). */
   topRooms(limit: number): Array<{ ownerId: string; likes: number; visits: number }>
 }
@@ -382,7 +387,7 @@ export function createDottownStore(opts?: { dataDir?: string; persist?: boolean 
         }
       }
     } catch (e) {
-      console.error('[dottown] dottown.json 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[dottown] dottown.json 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
@@ -740,14 +745,16 @@ export function createDottownStore(opts?: { dataDir?: string; persist?: boolean 
 
     removeGuest(ownerId, requesterId, entryId) {
       const s = social[ownerId]
-      if (!s) return { ok: true, guestbook: [] }
+      if (!s) return { ok: true }
       const entry = s.guestbook.find((e) => e.id === entryId)
-      if (!entry) return { ok: true, guestbook: s.guestbook.map((e) => ({ ...e })) } // 이미 없음 — 멱등
+      // 이미 없음 — 멱등. 목록은 싣지 않는다(로비 방명록과 같은 규칙: 없는 번호를 대는 것이
+      // 남의 방명록을 읽는 길이 되면 안 된다). 부르는 쪽은 안 온 목록을 '변화 없음'으로 읽는다.
+      if (!entry) return { ok: true }
       // 방 주인(대상=요청자) 또는 작성자만 삭제 가능.
       if (requesterId !== ownerId && requesterId !== entry.authorId) return { ok: false, error: '삭제 권한이 없습니다.' }
       s.guestbook = s.guestbook.filter((e) => e.id !== entryId)
       save()
-      return { ok: true, guestbook: s.guestbook.map((e) => ({ ...e })) }
+      return { ok: true, removed: true, guestbook: s.guestbook.map((e) => ({ ...e })) }
     },
 
     topRooms(limit) {

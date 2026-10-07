@@ -234,7 +234,7 @@ export function createCommunityCatalog(opts?: { dataDir?: string; persist?: bool
         }
       }
     } catch (e) {
-      console.error('[community/catalog] 로드 실패 — 빈 도감으로 시작:', e)
+      console.error('[community/catalog] 로드 실패. 빈 도감으로 시작:', e)
     }
   }
 

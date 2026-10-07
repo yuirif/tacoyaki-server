@@ -1,6 +1,6 @@
 // 도트타운 UGC 마켓 — 유저 제작 가구/의상을 코인으로 사고판다(창작 경제).
 // 이미지는 자산 스토어(asset:<sha256>)에 올라가고, 마켓은 '메타 + 파일 해시 맵'만 보관한다.
-// ⚠자산 GC: 등록/보유 아이템의 파일 해시를 collectAssetRefs 로 라이브셋에 반드시 실어야 한다(안 그러면 1시간 후 회수).
+// ⚠자산 GC: 등록/보유 아이템의 파일 해시를 collectAssetRefs 로 라이브셋에 반드시 실어야 한다(안 그러면 최대 6시간 뒤 회수).
 // 소유는 '스냅샷'(구매 시점의 파일 맵 복사)이라 판매자가 등록을 내려도 구매자는 계속 쓸 수 있다.
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -144,7 +144,7 @@ export function createMarketStore(opts?: { dataDir?: string; persist?: boolean }
         if (d.owned && typeof d.owned === 'object') owned = d.owned
       }
     } catch (e) {
-      console.error('[market] dottown-market.json 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[market] dottown-market.json 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

@@ -17,6 +17,22 @@ const ASSET_REF_RE = /asset:([a-f0-9]{64})/g
 /** 미참조 자산 청소 시, 막 업로드돼 아직 어디에도 박히지 않은 자산을 지우지 않기 위한 유예(기본 1시간). */
 const DEFAULT_SWEEP_GRACE_MS = 60 * 60 * 1000
 
+/** 청소 옵션 — 유예 길이와 기준 시각(테스트에서 시간을 밀어 넣는다). */
+export interface SweepOpts {
+  graceMs?: number
+  now?: number
+}
+/** 청소(또는 계산) 결과 — 지운 것 / 확보 바이트 / 유예로 남긴 것 / 지우지 못한 것. */
+export interface SweepResult {
+  removed: number
+  freed: number
+  /** 미참조지만 아직 유예 중이라 손대지 않은 개수·바이트('지금은 회수 불가'를 사람에게 설명하는 근거). */
+  deferred: number
+  deferredBytes: number
+  /** 지우려다 실패한 개수(파일 잠김·권한 등). 색인은 건드리지 않고 다음 회차에 재시도한다. */
+  failed: number
+}
+
 /** 자산으로 저장을 허용하는 MIME 대분류 — 이 프로그램이 올리는 것은 이미지·음원·영상·폰트뿐이다. */
 const MIME_FAMILY_RE = /^(image|audio|video|font)\/[\w.+-]+$/
 /**
@@ -30,6 +46,28 @@ const MIME_DENY_RE = /^image\/svg/i
  * 업로드 MIME 정규화 — 허용 목록 밖은 'application/octet-stream' 으로 강등한다(거부가 아니라 강등:
  * 알 수 없는 타입도 저장은 되되 문서로 해석되지 않는다). 서빙 시 선언 타입이 그대로 나가므로 여기가 유일한 관문이다.
  */
+/**
+ * data URL(base64) → 그 바이트의 sha256 해시. put() 이 붙일 이름과 **정확히 같아야** 한다.
+ *
+ * 채팅 두상은 방 저장본엔 data URL 로 남고, 입장 스냅샷을 보낼 때만 자산으로 내부화된다.
+ * 그래서 참조 수집기(asset: 문자열만 훑는다)는 그 자산을 못 찾아 '아무도 안 쓰는 파일'로 판정한다 —
+ * 관리 화면의 '회수 가능'이 늘 비슷한 값으로 돌아오는 정체다. 이 함수로 그 data URL 도 라이브로 센다.
+ * 규칙이 put 과 1바이트라도 어긋나면 반대로 '쓰고 있는 두상'을 지우게 되므로 테스트로 못박아 둔다.
+ */
+export function dataUrlHash(s: unknown): string | null {
+  if (typeof s !== 'string' || !s.startsWith('data:')) return null
+  const comma = s.indexOf(',')
+  if (comma < 0) return null
+  if (!/;base64$/i.test(s.slice(5, comma))) return null
+  try {
+    const bytes = Buffer.from(s.slice(comma + 1), 'base64')
+    if (bytes.length === 0) return null
+    return createHash('sha256').update(bytes).digest('hex')
+  } catch {
+    return null
+  }
+}
+
 export function safeAssetMime(mime: unknown): string {
   if (typeof mime !== 'string') return 'application/octet-stream'
   // 'audio/mpeg; codecs=…' 처럼 파라미터가 붙어 오는 경우가 있어 앞부분만 본다.
@@ -59,9 +97,14 @@ export interface AssetStore {
    * 미참조 자산 일괄 청소(mark-and-sweep). live=지금 어디서든 참조 중인 해시 집합(상위가 전 방·캐릭터·계정에서 수집).
    * 콘텐츠 주소라 자산은 방·캐릭터 간 공유되므로 '한 곳에서 지웠다'고 바로 지우면 안 됨 — 전역 라이브 집합에 없을 때만 회수.
    * graceMs 이내 생성(파일 mtime)된 자산은 '업로드 직후 아직 미참조' 가능성으로 보존(레이스 방지).
-   * 반환: 삭제 개수·확보 바이트.
+   * 반환: 삭제 개수·확보 바이트 + 유예로 남긴 것·지우지 못한 것.
    */
-  sweep(live: Set<string>, opts?: { graceMs?: number; now?: number }): { removed: number; freed: number }
+  sweep(live: Set<string>, opts?: SweepOpts): SweepResult
+  /**
+   * 지금 청소하면 얼마나 지워지는지만 계산(아무것도 지우지 않는다) — 관리 화면의 '회수 가능'.
+   * sweep 과 같은 코드를 타므로 표시와 실제가 어긋나지 않는다.
+   */
+  orphanStats(live: Set<string>, opts?: SweepOpts): SweepResult
   /** 현재 보관 중인 전체 자산 해시(진단/테스트). */
   hashes(): string[]
   /** 단일 자산 바이트 크기(없으면 0). 관리자 용량 산출용. */
@@ -92,7 +135,7 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
         for (const [h, m] of Object.entries(obj)) if (HASH_RE.test(h) && typeof m === 'string') mimes.set(h, safeAssetMime(m))
       }
     } catch (e) {
-      console.error('[assets] index.json 로드 실패 — 빈 색인으로 시작:', e)
+      console.error('[assets] index.json 로드 실패. 빈 색인으로 시작:', e)
     }
   }
 
@@ -120,6 +163,111 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
     } catch (e) {
       console.error('[assets] index.json 저장 실패:', e)
     }
+  }
+
+  /**
+   * 미참조 자산 훑기 — 실제 삭제(apply=true)와 '얼마나 지울 수 있나' 계산(apply=false)이 같은 코드를 탄다.
+   *
+   * 이 둘이 갈라지면 회수 가능 용량은 잡히는데 정리를 눌러도 하나도 줄지 않는다. 표시 쪽이 단순히
+   * (전체 − 참조중) 을 빼고, 실삭제 쪽은 만든 지 얼마 안 된 파일을 유예로 건너뛰기 때문이다. 같은 잣대를 쓴다.
+   * 유예로 남긴 것(deferred)과 지우다 실패한 것(failed)을 따로 세어 호출 측이 사람에게 설명할 수 있게 한다.
+   */
+  function scan(live: Set<string>, opts: SweepOpts | undefined, apply: boolean): SweepResult {
+    const graceMs = opts?.graceMs ?? DEFAULT_SWEEP_GRACE_MS
+    const cutoff = (opts?.now ?? Date.now()) - graceMs
+    // 디스크의 모든 자산 파일을 진실원본으로 — 색인에 없어도(쓰기 실패 등) 회수 대상에 포함.
+    const all = new Set<string>(mimes.keys())
+    for (const h of memBytes.keys()) all.add(h)
+    const stale: string[] = [] // 해시 이름이 아닌 잔여 임시파일(업로드 실패 흔적) — 집계·회수 사각지대다
+    if (persist) {
+      try {
+        for (const f of readdirSync(dir)) {
+          if (HASH_RE.test(f)) all.add(f)
+          else if (f.endsWith('.tmp')) stale.push(f)
+        }
+      } catch {
+        /* 디렉터리 없음 — 회수할 것 없음 */
+      }
+    }
+    let removed = 0
+    let freed = 0
+    let deferred = 0
+    let deferredBytes = 0
+    let failed = 0
+    let indexDirty = false
+    for (const hash of all) {
+      if (live.has(hash)) continue
+      if (persist) {
+        const f = join(dir, hash)
+        let size = 0
+        try {
+          const st = statSync(f)
+          size = st.size
+          if (st.mtimeMs > cutoff) {
+            // 유예 — 막 올라온 자산은 보존(아직 어떤 참조에도 안 박혔을 수 있다).
+            deferred++
+            deferredBytes += size
+            continue
+          }
+        } catch {
+          // 파일이 이미 없다 — 색인만 남은 유령. 아래에서 색인을 정리한다.
+          size = 0
+        }
+        if (size > 0) {
+          if (!apply) {
+            removed++
+            freed += size
+            continue // 계산만 — 색인·파일 어느 것도 건드리지 않는다
+          }
+          try {
+            unlinkSync(f)
+          } catch (e) {
+            // 지우지 못했다(윈도 자가호스팅의 파일 잠김·권한 등). 색인을 지우면 파일은 남고 MIME 만
+            // 잃어 이후 octet-stream 으로 강등된다 — 통계도 거짓이 된다. 그대로 두고 다음 회차에 재시도한다.
+            failed++
+            console.error(`[assets] ${hash.slice(0, 8)} 삭제 실패:`, e)
+            continue
+          }
+          freed += size
+        } else if (!apply) {
+          // 색인만 남은 유령 — 지워도 디스크가 줄지 않으므로 회수량에 넣지 않는다.
+          continue
+        }
+      } else if (!apply) {
+        removed++
+        freed += memBytes.get(hash)?.length ?? 0
+        continue
+      } else {
+        freed += memBytes.get(hash)?.length ?? 0
+      }
+      if (mimes.delete(hash)) indexDirty = true
+      memBytes.delete(hash)
+      removed++
+    }
+    // 업로드 실패로 남은 임시파일 — 유예를 넘긴 것만 치운다(진행 중인 업로드를 건드리지 않게).
+    for (const name of stale) {
+      const f = join(dir, name)
+      try {
+        const st = statSync(f)
+        if (st.mtimeMs > cutoff) {
+          deferred++
+          deferredBytes += st.size
+          continue
+        }
+        if (!apply) {
+          removed++
+          freed += st.size
+          continue
+        }
+        unlinkSync(f)
+        removed++
+        freed += st.size
+      } catch {
+        /* 이미 없음/권한 — 다음 회차 재시도 */
+      }
+    }
+    if (indexDirty) saveIndex()
+    return { removed, freed, deferred, deferredBytes, failed }
   }
 
   return {
@@ -226,40 +374,11 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
     },
 
     sweep(live, opts) {
-      const graceMs = opts?.graceMs ?? DEFAULT_SWEEP_GRACE_MS
-      const cutoff = (opts?.now ?? Date.now()) - graceMs
-      // 디스크의 모든 자산 파일을 진실원본으로 — 색인에 없어도(쓰기 실패 등) 회수 대상에 포함.
-      const all = new Set<string>(mimes.keys())
-      for (const h of memBytes.keys()) all.add(h)
-      if (persist) {
-        try {
-          for (const f of readdirSync(dir)) if (HASH_RE.test(f)) all.add(f)
-        } catch {
-          /* 디렉터리 없음 — 회수할 것 없음 */
-        }
-      }
-      let removed = 0
-      let freed = 0
-      let indexDirty = false
-      for (const hash of all) {
-        if (live.has(hash)) continue
-        if (persist) {
-          const f = join(dir, hash)
-          try {
-            const st = statSync(f)
-            if (st.mtimeMs > cutoff) continue // 유예 — 막 올라온 자산은 보존(아직 참조에 박히기 전)
-            unlinkSync(f)
-            freed += st.size
-          } catch {
-            /* 이미 없음 — 색인만 정리 */
-          }
-        }
-        if (mimes.delete(hash)) indexDirty = true
-        memBytes.delete(hash)
-        removed++
-      }
-      if (indexDirty) saveIndex()
-      return { removed, freed }
+      return scan(live, opts, true)
+    },
+
+    orphanStats(live, opts) {
+      return scan(live, opts, false)
     },
 
     hashes() {

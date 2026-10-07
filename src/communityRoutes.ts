@@ -5,7 +5,8 @@
 // 권한 판정은 community 의 can() 하나만 쓴다 — 여기에 다른 검사 경로를 만들지 않는다.
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { PermCtx, Board, PermKey } from './community'
-import type { PostSummary, SaveInput } from './communityPost'
+import type { Post, PostSummary, SaveInput } from './communityPost'
+import { sanitizePostHtml } from './posts'
 import { ECON_ROUTES } from './communityEconRoutes'
 import { GAME_ROUTES } from './communityGameRoutes'
 import {
@@ -87,6 +88,30 @@ function maskLive<T extends Spoken & { secret?: boolean; text: string; images: s
   return out
 }
 
+/**
+ * 내보내기 직전 서식 칸을 한 번 더 훑는다.
+ *
+ * 저장할 때 거르는 것만으로는 부족하다 — 이 기능이 생기기 전에 저장된 값, 관리자가 나중에 칸 종류를
+ * 'rich' 로 바꾼 값은 날것 그대로 남아 있고, 화면은 그 값을 HTML 로 그린다. 읽어 나갈 때 한 번 더
+ * 걸러 두면 옛 저장분도 안전해진다(원본 파일은 건드리지 않는다).
+ */
+function sanitizeRichFields(post: Post, board: Board | null): Post {
+  const keys = (board?.form ?? []).filter((f) => f.type === 'rich').map((f) => f.key)
+  if (!keys.length) return post
+  let touched = false
+  const fields: Record<string, unknown> = { ...post.fields }
+  for (const k of keys) {
+    const v = fields[k]
+    if (typeof v !== 'string' || !v) continue
+    const clean = sanitizePostHtml(v)
+    if (clean !== v) {
+      fields[k] = clean
+      touched = true
+    }
+  }
+  return touched ? { ...post, fields } : post
+}
+
 /** 이 사람이 이 글을 볼 수 있는가 — 공개 범위와 게시판 권한을 함께 본다. */
 function canSeePost(c: Ctx, authorId: string, visibility: string): boolean {
   if (visibility === 'all') return true
@@ -132,6 +157,9 @@ const BOARD_ROUTES: Record<string, Route> = {
           logo: set.logo,
           stage: set.stage,
           joinMode: set.joinMode,
+          readMode: set.readMode,
+          homeBoardId: set.homeBoardId,
+          homeIntro: set.homeIntro,
           theme: set.theme,
           labels: set.labels,
           roles: set.roles,
@@ -200,7 +228,7 @@ const BOARD_ROUTES: Record<string, Route> = {
       if (got.post.publishAt > c.now && !mine && !c.can('board.deleteAny')) return fail('글을 찾을 수 없습니다.', 404)
       const canSecret = mine || c.can('board.viewSecret')
       return ok({
-        post: anonymize(got.post, c, c.board),
+        post: anonymize(sanitizeRichFields(got.post, c.board), c, c.board),
         // 비밀 댓글은 쓴 사람·글 주인·열람 권한자만. 나머지에게는 자리만 남긴다.
         comments: got.comments.map((cm) =>
           anonymize(cm.secret && !canSecret && cm.authorId !== c.account.id ? { ...cm, text: '', images: [] } : cm, c, c.board)
@@ -211,7 +239,8 @@ const BOARD_ROUTES: Record<string, Route> = {
   },
 
   '/cmty/char/list': {
-    need: 'login',
+    // 캐릭터 색인은 게시판 스코프가 없어 board.read 로 가릴 수 없다 — 멤버십 자체를 문턱으로 둔다.
+    need: 'member',
     run(b, _c, d) {
       return ok({
         items: d.chars.list({
@@ -225,7 +254,7 @@ const BOARD_ROUTES: Record<string, Route> = {
   },
 
   '/cmty/char/get': {
-    need: 'login',
+    need: 'member',
     run(b, _c, d) {
       const doc = d.chars.view(s(b.charId, 64))
       if (!doc) return fail('캐릭터를 찾을 수 없습니다.', 404)
@@ -252,6 +281,35 @@ const BOARD_ROUTES: Record<string, Route> = {
     }
   },
 
+  /** 커뮤니티 안에서 쓰는 이름 고치기. 이미 올라간 글의 이름은 그때 각인된 그대로 남는다. */
+  '/cmty/profile': {
+    need: 'member',
+    run(b, c, d) {
+      const r = d.community.setNick(c.account.id, s(b.nick, 20), c.now)
+      if (!r.ok) return fail(r.error)
+      d.emitAccount(c.account.id, 'cmty:perm', { permVersion: d.community.settings()?.permVersion ?? 0 })
+      return ok({ member: r.value })
+    }
+  },
+
+  /** 커뮤니티에서 나가기. 쓴 글·댓글은 남는다(남의 글타래가 구멍 나지 않게). */
+  '/cmty/leave': {
+    need: 'member',
+    run(_b, c, d) {
+      // 심사를 기다리는 중이면 '나가기'가 아니라 '신청 취소'다 — 멤버 자리만 지우고 신청서를 남기면
+      // 다시 신청할 수도, 승인받을 수도 없는 자리에 갇힌다.
+      if (c.member?.roleId === 'pending') {
+        d.community.withdrawApplication(c.account.id)
+        return ok()
+      }
+      const r = d.community.leave(c.account.id)
+      if (!r.ok) return fail(r.error)
+      c.audit('member.leave', '스스로 나감', { type: 'member', id: c.account.id })
+      d.emitAccount(c.account.id, 'cmty:perm', { permVersion: d.community.settings()?.permVersion ?? 0 })
+      return ok()
+    }
+  },
+
   // ── 글 ──────────────────────────────────────────────────────────────────
   '/cmty/post/save': {
     need: 'board.write',
@@ -266,9 +324,16 @@ const BOARD_ROUTES: Record<string, Route> = {
         const mine = sum.authorId === c.account.id
         if (!mine && !c.can('board.editAny')) return fail('수정할 수 없습니다.', 403)
         if (mine && !c.can('board.edit')) return fail('수정할 수 없습니다.', 403)
+        // 게시판을 바꾸는 길은 /cmty/post/move 하나뿐이다. 여기로 다른 게시판을 보내면 저장은 그 게시판
+        // 양식으로 칸을 걷으면서 글은 제자리에 남아, 화면에 없는 값이 조용히 사라진다.
+        if (sum.boardId !== s(b.boardId, 64)) return fail('글의 게시판이 바뀌었습니다. 화면을 새로 열어 주세요.')
       }
       if (b.visibility === 'secret' && !c.can('board.secret')) return fail('비밀글을 쓸 수 없습니다.', 403)
-      const hasImages = !!s(b.cover, 80) || (Array.isArray(b.gallery) && b.gallery.length > 0)
+      // 첨부 권한 검사 — 이번에 '새로' 붙이는 그림만 본다. 이미 올라간 글의 표지를 그대로 되보내는
+      // 수정 요청까지 막으면, 권한이 닫힌 게시판에서 자기 글을 영영 못 고친다.
+      const prevCover = postId ? (d.posts.summary(postId)?.cover ?? '') : ''
+      const cover = s(b.cover, 80)
+      const hasImages = (!!cover && cover !== prevCover) || (Array.isArray(b.gallery) && b.gallery.length > 0)
       if (hasImages && !c.can('board.attach')) return fail('이미지를 첨부할 수 없습니다.', 403)
 
       const who = speakingAs(c, d, b.charId)
@@ -276,16 +341,24 @@ const BOARD_ROUTES: Record<string, Route> = {
 
       const nick = c.member?.nick || c.account.nickname || c.account.username
       // 본문의 각 칸은 저장소가 형태별로 다시 검사한다 — 여기서는 게시판·발화자·수위만 확정해 넘긴다.
+      // ⚠ 어느 칸이 '본문(서식)' 인지는 **게시판 양식**이 정한다. 요청이 정하게 두면, 그 목록에서 이름 하나만
+      //    빼는 것으로 새니타이저를 건너뛴 날 HTML 을 저장할 수 있다(그 값은 화면에서 HTML 로 그려진다).
       const input = {
         ...b,
         boardId: s(b.boardId, 64),
+        richFieldKeys: (c.board?.form ?? []).filter((f) => f.type === 'rich').map((f) => f.key),
+        linkFieldKeys: (c.board?.form ?? []).filter((f) => f.type === 'link').map((f) => f.key),
+        tagsKey: (c.board?.form ?? []).find((f) => f.type === 'tags')?.key ?? '',
+        formKeys: (c.board?.form ?? []).map((f) => f.key),
         charId: who.charId,
         charName: who.charName,
         rating: ratingFloor(c.board?.rating, b.rating)
       } as SaveInput
+      // 임시저장으로 만든 뒤 수정으로 발행하는 길도 '새 글'이다 — 그 경우까지 세야 활동 수가 맞는다.
+      const wasDraft = postId ? (d.posts.summary(postId)?.draft ?? false) : false
       const r = d.posts.save({ id: c.account.id, nick, avatar: c.account.avatar ?? '' }, input, c.now)
       if (!r.ok) return fail(r.error)
-      if (!postId && !r.value.draft) {
+      if ((!postId || wasDraft) && !r.value.draft) {
         d.community.bumpStat(c.account.id, 'posts', 1, c.now)
         // 활동 정산 — 대표 캐릭터가 없거나 꺼져 있으면 조용히 아무 일도 하지 않는다.
         // 보통 커뮤니티는 경제 자체가 닫혀 있다 — 아무도 볼 수 없는 지갑이 몰래 자라게 두지 않는다.
@@ -310,6 +383,8 @@ const BOARD_ROUTES: Record<string, Route> = {
       if (sum.authorId !== c.account.id && !c.can('board.deleteAny')) return fail('삭제할 수 없습니다.', 403)
       const r = d.posts.remove(postId, c.account.id, c.now)
       if (!r.ok) return fail(r.error)
+      // 지운 글은 활동 수에서도 내린다 — 임시저장은 애초에 세지 않았으니 뺄 것도 없다.
+      if (!sum.draft) d.community.bumpStat(sum.authorId, 'posts', -1, c.now)
       if (sum.authorId !== c.account.id) c.audit('post.remove', sum.title, { type: 'post', id: postId })
       d.emitTo('cmtyb:' + sum.boardId, 'cmty:post', { boardId: sum.boardId, op: 'remove', postId })
       return ok({ post: r.value })
@@ -323,7 +398,10 @@ const BOARD_ROUTES: Record<string, Route> = {
       // 관리자가 아니면 자기가 지운 것만 되살릴 수 있다.
       const ownOnly = c.member?.roleId !== 'owner' && !c.isAppAdmin
       const r = d.posts.restore(s(b.postId, 64), c.account.id, ownOnly)
-      if (r.ok) c.audit('post.restore', r.value.title, { type: 'post', id: r.value.id })
+      if (r.ok) {
+        if (!r.value.draft) d.community.bumpStat(r.value.authorId, 'posts', 1, c.now)
+        c.audit('post.restore', r.value.title, { type: 'post', id: r.value.id })
+      }
       return from(r, 'post')
     }
   },
@@ -353,6 +431,40 @@ const BOARD_ROUTES: Record<string, Route> = {
     }
   },
 
+  // 글을 다른 게시판으로 옮긴다(카테고리 변경). 글쓴이 본인이거나 이동 권한이 있는 운영진만.
+  // 옮길 곳에도 읽기·쓰기 권한이 있어야 한다 — 못 읽는 곳으로 빼돌리거나 숨은 게시판에 밀어 넣을 수 없게.
+  '/cmty/post/move': {
+    need: 'board.read',
+    scope: 'postId',
+    rate: 'social',
+    run(b, c, d) {
+      const postId = s(b.postId, 64)
+      const sum = d.posts.summary(postId)
+      if (!sum) return fail('글을 찾을 수 없습니다.', 404)
+      const mine = sum.authorId === c.account.id
+      if (mine ? !c.can('board.edit') : !c.can('board.move')) return fail('옮길 수 없습니다.', 403)
+
+      const dest = d.community.board(s(b.toBoardId, 64))
+      if (!dest) return fail('옮길 게시판을 찾을 수 없습니다.', 404)
+      if (dest.id === sum.boardId) return fail('이미 그 게시판에 있는 글입니다.')
+      if (!c.can('board.read', dest) || !c.can('board.write', dest)) return fail('그 게시판에는 글을 옮길 수 없습니다.', 403)
+      // 종류가 다르면 저장 형태도 다르다 — 캐릭터 게시판의 글을 자유 게시판에 두면 화면이 읽지 못한다.
+      if (c.board && dest.kind !== c.board.kind) return fail('종류가 다른 게시판으로는 옮길 수 없습니다.')
+      // 익명 게시판을 드나들면 쓴 사람이 드러나거나 반대로 가려진다. 어느 쪽이든 본인 뜻과 다르게 바뀐다.
+      if (c.board && dest.anonymous !== c.board.anonymous) return fail('익명 여부가 다른 게시판으로는 옮길 수 없습니다.')
+
+      const fromId = sum.boardId
+      const r = d.posts.move(postId, dest.id, c.now)
+      if (!r.ok) return fail(r.error)
+      c.audit('post.move', `${r.value.title} → ${dest.name}`, { type: 'post', id: postId })
+      // 양쪽 게시판을 보고 있는 사람 모두에게 알린다 — 한쪽만 보내면 옛 목록에 유령 줄이 남는다.
+      d.emitTo('cmtyb:' + fromId, 'cmty:post', { boardId: fromId, op: 'update', postId })
+      d.emitTo('cmtyb:' + dest.id, 'cmty:post', { boardId: dest.id, op: 'new', postId })
+      // 익명 게시판의 글은 나가기 전에 쓴 사람을 지운다 — 목록·상세와 같은 규칙을 여기서도 지킨다.
+      return ok({ post: anonymize(r.value, c, dest) })
+    }
+  },
+
   '/cmty/post/comments': {
     need: 'board.read',
     scope: 'postId',
@@ -373,6 +485,8 @@ const BOARD_ROUTES: Record<string, Route> = {
     scope: 'postId',
     rate: 'social',
     run(b, c, d) {
+      // 읽는 것과 흔적을 남기는 것은 다르다 — 좋아요는 가입한 사람만.
+      if (!c.member) return fail('가입해야 누를 수 있습니다.', 403)
       const r = d.posts.like(s(b.postId, 64), c.account.id)
       return r.ok ? ok(r.value) : fail(r.error)
     }
@@ -382,8 +496,11 @@ const BOARD_ROUTES: Record<string, Route> = {
     need: 'board.read',
     scope: 'postId',
     rate: 'social',
-    run(b, _c, d) {
-      d.posts.addView(s(b.postId, 64))
+    run(b, c, d) {
+      const postId = s(b.postId, 64)
+      // 자기 글을 다시 열어 보는 것은 조회가 아니다 — 고치려고 드나들 때마다 숫자가 오르면 세는 뜻이 없다.
+      if (d.posts.summary(postId)?.authorId === c.account.id) return ok()
+      d.posts.addView(postId)
       return ok()
     }
   },
@@ -444,7 +561,11 @@ const BOARD_ROUTES: Record<string, Route> = {
     run(b, c, d) {
       const postId = s(b.postId, 64)
       const r = d.posts.removeComment(s(b.commentId, 64), postId, c.account.id, c.can('board.deleteAny'), c.now)
-      if (r.ok) d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'remove', comment: maskLive(r.value, c) })
+      if (r.ok) {
+        // 지운 댓글은 활동 수에서도 내린다(글 쪽 commentCount 는 저장소가 이미 다시 센다).
+        d.community.bumpStat(r.value.authorId, 'comments', -1, c.now)
+        d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'remove', comment: maskLive(r.value, c) })
+      }
       return from(r, 'comment')
     }
   },
@@ -640,7 +761,14 @@ const BOARD_ROUTES: Record<string, Route> = {
     run(_b, _c, d) {
       const chars = new Map<string, number>()
       for (const e of d.chars.list({ includeRetired: true })) chars.set(e.ownerId, (chars.get(e.ownerId) ?? 0) + 1)
-      return ok({ members: d.community.members().map((m) => ({ ...m, charCount: chars.get(m.accountId) ?? 0 })) })
+      return ok({
+        members: d.community.members().map((m) => ({
+          ...m,
+          charCount: chars.get(m.accountId) ?? 0,
+          // 커뮤니티 닉을 안 정한 사람(개설자가 그렇다)은 계정 이름으로 채워 보낸다 — 목록에 계정 id 가 새지 않게.
+          displayName: m.nick || d.auth.getAccountById(m.accountId)?.nickname || d.auth.getAccountById(m.accountId)?.username || ''
+        }))
+      })
     }
   },
   '/cmty/admin/member/role': {
@@ -773,6 +901,16 @@ const BOARD_ROUTES: Record<string, Route> = {
       return ok({ items: d.posts.trashList() })
     }
   },
+  /** 삭제함 영구 비우기. postIds 를 주면 그것만, 비우면 전부. 되살릴 수 없다. */
+  '/cmty/admin/trash/purge': {
+    need: 'cmty.manageBoards',
+    run(b, c, d) {
+      const ids = Array.isArray(b.postIds) ? b.postIds.map((x) => s(x, 64)).filter(Boolean) : []
+      const n = d.posts.purgeTrash(ids)
+      c.audit('trash.purge', `${n}건 영구 삭제`)
+      return ok({ removed: n })
+    }
+  },
   '/cmty/admin/audit': {
     need: 'cmty.viewAudit',
     run(b, _c, d) {
@@ -887,6 +1025,16 @@ export function createCommunityRoutes(d: CommunityRouteDeps) {
         console.error('[community] 라우트 오류:', req.url, e)
         send(fail('처리에 실패했습니다.', 500))
       }
+    }).catch((e: unknown) => {
+      // 위 try 는 라우트 본체만 감싼다 — 인증·권한 해석처럼 그 앞에서 터진 것을 받는 그물이 여기다.
+      // 놓치면 요청 하나의 예외로 서버가 통째로 내려가 접속자 전원이 끊긴다.
+      console.error('[community] 라우트 오류:', req.url, e)
+      if (res.headersSent) {
+        res.end()
+        return
+      }
+      res.writeHead(500, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '처리에 실패했습니다.' }))
     })
     return true
   }

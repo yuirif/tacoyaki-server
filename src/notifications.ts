@@ -17,13 +17,16 @@ export interface NotifInput {
 
 export interface NotifStore {
   /** ownerId 에게 알림 추가. 자기 자신이 낸 소식(owner===actor)은 만들지 않는다(null).
-   *  kind='dm' 은 같은 상대(actorId)의 기존 dm 항목을 교체(연속 메시지 도배 방지 — 최신 1건, 미읽음 재점등). */
+   *  kind='dm' 은 같은 상대(actorId)의 기존 dm 항목을 제자리에서 갱신(연속 메시지 도배 방지 — 최신 1건, 미읽음 재점등). */
   push(ownerId: string, n: NotifInput): NotifItem | null
   /** 최신순 전체 목록(상한 내). */
   list(ownerId: string): NotifItem[]
   unreadCount(ownerId: string): number
   /** ids 지정 시 해당 항목만, 없으면 전체 읽음 처리. 바뀐 개수 반환. */
   markRead(ownerId: string, ids?: string[]): number
+  /** 그 상대(actorId)가 낸 특정 종류의 알림만 읽음 처리. 바뀐 개수 반환.
+   *  DM 창은 '누구와의 대화'를 열 뿐 알림 항목 id 를 알지 못하므로, 끄는 기준을 상대로 둔다. */
+  markReadByActor(ownerId: string, kind: NotifKind, actorId: string): number
   /** 알림 전체 지우기(피드 비움) — 지운 개수 반환. 파일은 유지(빈 목록으로 플러시). */
   clear(ownerId: string): number
   /** 계정 탈퇴 연쇄 — 그 사용자의 알림 파일·캐시 제거. */
@@ -83,13 +86,16 @@ export function createNotifStore(opts?: { dataDir?: string; persist?: boolean })
       if (ownerId === n.actor.id) return null // 자기 알림 금지(셀프 댓글·본인 방명록 등)
       const text = (n.text ?? '').trim().slice(0, MAX_NOTIF_TEXT)
       const items = read(ownerId)
-      // DM 은 상대별 최신 1건만 유지 — 같은 상대의 기존 항목을 제거 후 새로 추가(읽음이었어도 재점등).
+      // DM 은 상대별 최신 1건만 유지 — 같은 상대의 기존 항목을 맨 뒤(최신)로 옮겨 갱신한다(읽음이었어도 재점등).
+      // 이때 항목 id 는 그대로 물려받는다. id 가 바뀌면 목록에서 그 줄이 통째로 새로 그려져, 이미 읽고 넘긴
+      // 알림이 말 한 마디마다 '새로 생긴 알림'처럼 보인다.
+      let prevId: string | undefined
       if (n.kind === 'dm') {
         const i = items.findIndex((x) => x.kind === 'dm' && x.actorId === n.actor.id)
-        if (i >= 0) items.splice(i, 1)
+        if (i >= 0) prevId = items.splice(i, 1)[0].id
       }
       const item: NotifItem = {
-        id: randomUUID(),
+        id: prevId ?? randomUUID(),
         kind: n.kind,
         actorId: n.actor.id,
         actorName: (n.actor.name || '익명').slice(0, 60),
@@ -118,6 +124,18 @@ export function createNotifStore(opts?: { dataDir?: string; persist?: boolean })
       for (const x of items) {
         if (x.read) continue
         if (want && !want.has(x.id)) continue
+        x.read = true
+        changed++
+      }
+      if (changed) flush(ownerId)
+      return changed
+    },
+    markReadByActor(ownerId, kind, actorId) {
+      if (!ownerId || !actorId) return 0
+      const items = read(ownerId)
+      let changed = 0
+      for (const x of items) {
+        if (x.read || x.kind !== kind || x.actorId !== actorId) continue
         x.read = true
         changed++
       }

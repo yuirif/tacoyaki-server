@@ -1,6 +1,6 @@
 // 커뮤니티 라우트 표가 공유하는 것들 — 형태·문맥·의존물·짧은 도우미.
 //
-// 라우트 묶음이 둘로 갈리면서(게시판 쪽 / 경제 쪽) 두 파일이 서로를 부르게 됐다.
+// 라우트 묶음이 둘로 갈려 있어(게시판 쪽 / 경제 쪽) 두 파일이 서로를 부르는 모양이 되기 쉽다.
 // 서로 부르는 모양은 로딩 순서에 따라 값이 비어 오는 사고를 부르므로, 공유물만 여기로 떼어 낸다.
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AuthStore, PublicAccount } from './auth'

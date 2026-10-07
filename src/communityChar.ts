@@ -504,7 +504,7 @@ export function createCommunityCharStore(opts?: { dataDir?: string; persist?: bo
         }
       }
     } catch (e) {
-      console.error('[community/char] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community/char] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
@@ -706,7 +706,7 @@ export function createCommunityCharStore(opts?: { dataDir?: string; persist?: bo
         }
         doc.profile = prof
       }
-      // ★ 능력치 — 양식에서 '본인이 고칠 수 있는' 칸만 받는다.
+      // 능력치 — 양식에서 '본인이 고칠 수 있는' 칸만 받는다.
       //   그 외 칸이 섞여 와도 오류로 만들지 않고 조용히 버린다(구버전 클라가 통째로 보내도 깨지지 않게).
       if (r.stats && typeof r.stats === 'object') {
         const incoming = r.stats as Record<string, unknown>

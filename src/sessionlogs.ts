@@ -115,6 +115,8 @@ export interface SessionLogStore {
   listFor(viewerId: string | null, targetId: string): { logs: SessionLogSummary[]; boards: Board[] }
   /** 로그 상세 — 비공개는 작성자만. 권한 없으면 null. */
   get(viewerId: string | null, logId: string): { log: SessionLogDetail } | null
+  /** 이 로그의 주인 계정 id — 본문을 내주기 전에 로비 열람 권한을 물어보는 데 쓴다. 없는 로그면 null. */
+  ownerOf(logId: string): string | null
   /** 백업 생성(html 필요) 또는 수정(id 소유 — html 은 보낼 때만 본문 교체). */
   save(authorId: string, input: SessionLogInput): SessionLogSaveResult
   /** 삭제(작성자). */
@@ -189,7 +191,7 @@ export function createSessionLogStore(opts?: { dataDir?: string; persist?: boole
         if (data.boards && typeof data.boards === 'object') boards = data.boards
       }
     } catch (e) {
-      console.error('[sessionlogs] sessionlogs.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[sessionlogs] sessionlogs.json 로드 실패. 빈 목록으로 시작:', e)
     }
   }
 
@@ -245,6 +247,10 @@ export function createSessionLogStore(opts?: { dataDir?: string; persist?: boole
       const l = findLog(logId)
       if (!l || !canView(viewerId, l)) return null
       return { log: detail(l) }
+    },
+
+    ownerOf(logId) {
+      return findLog(logId)?.authorId ?? null
     },
 
     save(authorId, input) {

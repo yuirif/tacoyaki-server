@@ -5,7 +5,7 @@
 //      열린다. guest 는 프로필 편집·세션방 PL 참여만 가능(호스팅 용량 보호용 안전장치).
 //   ② 방 역할 GM/PL(rooms.ts, 생성자=소유자=GM)은 ①과 별개로 방 안에서만 의미를 가진다.
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, unlinkSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { collectAssetRefs as scanAssetRefs } from './assets'
 import type { PresenceStatus, ProfileLink, ProfileTheme } from './protocol'
@@ -36,10 +36,36 @@ const ASSET_REF_RE = /^asset:[a-f0-9]{64}$/
  * 참조는 그대로 통과(GET /asset 가 서빙·collectAssetRefs 가 GC 보존), data URL 은 기존처럼 검증·길이 캡.
  * 그 외 문자열은 거부(CSS 주입 방지).
  */
-function lobbyImageRef(v: unknown, maxLen: number): string | undefined {
+function lobbyImageRef(v: unknown, maxLen: number, audio = false): string | undefined {
   if (typeof v !== 'string' || !v) return undefined
   if (ASSET_REF_RE.test(v)) return v
-  return /^data:image\/[a-z0-9.+-]+[;,]/i.test(v) ? v.slice(0, maxLen) : undefined
+  const re = audio ? /^data:audio\/[a-z0-9.+-]+[;,]/i : /^data:image\/[a-z0-9.+-]+[;,]/i
+  return re.test(v) ? v.slice(0, maxLen) : undefined
+}
+
+/**
+ * 그림 틀 정규화 — 숫자 몇 개만 통과시킨다. 클라와 같은 한계를 여기서 다시 건다.
+ * ⚠ 여기 없는 칸은 조용히 사라진다(스냅샷은 화이트리스트로 새로 지어진다). 그러면 발행은 성공한
+ *    것처럼 보이는데 새 기기에서 되받을 때 그 값만 없다.
+ * 높이는 위젯마다 한계가 다르지만 서버는 어느 위젯 것인지 모른다 — 두 한계를 아우르는 범위로 받고,
+ * 실제 위젯 한계는 그리는 쪽(클라 normalizeFrame)이 다시 좁힌다.
+ */
+function lobbyImageFrame(v: unknown): LobbyImageFrame | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  const num = (x: unknown, lo: number, hi: number): number | undefined =>
+    typeof x === 'number' && Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : undefined
+  const out: LobbyImageFrame = {}
+  const h = num(o.h, 96, 460)
+  if (h !== undefined) out.h = Math.round(h)
+  if (o.fit === 'contain' || o.fit === 'cover') out.fit = o.fit
+  const zoom = num(o.zoom, 1, 3)
+  if (zoom !== undefined) out.zoom = Math.round(zoom * 100) / 100
+  const x = num(o.x, 0, 100)
+  if (x !== undefined) out.x = Math.round(x)
+  const y = num(o.y, 0, 100)
+  if (y !== undefined) out.y = Math.round(y)
+  return Object.keys(out).length ? out : undefined
 }
 
 /** 프로필 색 테마 정규화 — 모든 값 hex 검증. 전부 비면 undefined(제거). */
@@ -91,10 +117,14 @@ export interface UserSummary {
   username: string
   nickname?: string
   avatar?: string
+  /** 로비 비공개 계정 — 목록에 자물쇠를 그리기 위한 표시(공개 계정이면 생략). */
+  lobbyPrivate?: boolean
 }
 
 /** 관리자 서버관리용 계정 요약(등급·가입일·마지막 접속 포함 — admin 전용). */
 export interface AdminAccountInfo {
+  /** 로비를 친구에게만 열어 둔 계정인가. 관리 화면이 표시한다. */
+  lobbyPrivate?: boolean
   id: string
   username: string
   nickname?: string
@@ -117,6 +147,7 @@ export interface LobbyGalleryItem {
   memo: string
   colors: string[]
   image?: string
+  frame?: LobbyImageFrame
 }
 export interface LobbyDDayItem {
   title: string
@@ -124,11 +155,26 @@ export interface LobbyDDayItem {
   mode: 'until' | 'since'
   date: string
   image?: string
+  frame?: LobbyImageFrame
+}
+/**
+ * 그림을 담는 틀 — 크기·채움·확대·자리. 그림 자체는 건드리지 않고 '보여 주는 방법'만 담는다.
+ * 숫자 몇 개라 용량 예산과 무관하고, 잘라 구운 사본을 따로 저장하지 않아도 방문자가 같은 모양으로 본다.
+ */
+export interface LobbyImageFrame {
+  h?: number
+  fit?: 'cover' | 'contain'
+  zoom?: number
+  x?: number
+  y?: number
 }
 /** 공개 캘린더 일정 1건(읽기전용 — 텍스트·색만). */
 export interface LobbyCalEvent {
   text: string
   color: string
+  /** 반복 주기·종료일 — 방문자 달력도 회차를 펼쳐 그린다. 구버전 스냅샷엔 없음. */
+  repeat?: 'weekly' | 'biweekly' | 'monthly' | 'yearly'
+  repeatUntil?: string
 }
 /** 공개 스티커 1개 — 바탕화면에 자유 배치한 이미지 장식(테두리·그림자 옵션). 방문 시 읽기전용 렌더. */
 export interface LobbySticker {
@@ -144,8 +190,47 @@ export interface LobbySticker {
   borderWidth: number
   /** 그림자 on/off. */
   shadow: boolean
+  /** 기울기(도, -180~180). 구버전 스냅샷엔 없음 → 0으로 본다. */
+  rot?: number
   /** 스티커 이미지(asset 참조 또는 data URL). 없으면 스티커 자체가 무의미 → sanitize 가 제외. */
   image?: string
+}
+/** 공개 스냅샷에 실리는 로비 위젯 창 1개의 배치(열림·좌표·크기·겹침·최소화).
+ *  기기 로컬이던 배치를 계정에 실어 다른 기기(웹판·폰)에서도 같은 자리로 되살린다. */
+export interface LobbyWin {
+  open: boolean
+  x: number
+  y: number
+  w: number
+  h: number
+  z: number
+  min: boolean
+}
+/** 로비 음악 1곡 — 오디오(src)는 공개 스냅샷에 싣지 않고 본인만 받는 별도 보관함에 둔다.
+ *  공개 스냅샷에 넣으면 방문자가 남의 음원을 통째로 내려받게 되고, 참조만 알면 누구나 /asset 으로
+ *  원본을 가져갈 수 있다. */
+export interface LobbyMusicTrack {
+  title: string
+  cover?: string
+  /** 오디오 'asset:<해시>' 참조(또는 data URL). 본인 조회에서만 응답에 실린다. */
+  src: string
+  /** 곡별 음량(0~1). 미설정=1. 기기의 전체 볼륨과 곱해져 실제 소리가 된다. */
+  volume?: number
+}
+/** 세션 BGM 라이브러리 1곡 — 기기(IndexedDB)에 있던 목록을 계정에 얹어 웹·프로그램이 같은 목록을 본다.
+ *  로비 음악과 마찬가지로 본인만 조회할 수 있다(방문자에게 내주지 않는다). */
+export interface BgmLibraryTrack {
+  title: string
+  /** file=오디오 · youtube=영상 id */
+  kind: 'file' | 'youtube'
+  /** file 은 'asset:<해시>' 참조(또는 data URL 폴백), youtube 는 영상 id. */
+  src: string
+  loop: boolean
+  volume?: number
+  size?: number
+  /** 소속 세션방 id — 없으면 모든 방에서 보이는 공용 트랙. */
+  roomId?: string
+  createdAt: number
 }
 /** 사용자가 공개(동기화)한 로비 스냅샷 — 다른 사람이 '로비 방문' 시 이 데이터로 읽기전용 렌더. */
 export interface LobbySnapshot {
@@ -168,6 +253,8 @@ export interface LobbySnapshot {
   hiddenIcons?: Record<string, boolean>
   /** 바탕화면 스티커(그리는 순서 = 배열 순서 = 겹침 순서). */
   stickers: LobbySticker[]
+  /** 위젯 창 배치(위젯키 → 창 상태). 구버전 스냅샷엔 없음 → 복원 시 옵셔널 처리. */
+  widgets?: Record<string, LobbyWin>
   updatedAt: number
 }
 
@@ -178,7 +265,11 @@ const MAX_LOBBY_COVER = 400_000 // 음악 트랙 커버 1개
 const MAX_LOBBY_COVER_TOTAL = 5_000_000 // 커버 합계 상한 — accounts.json 비대화·본문 한도 방지(초과분은 제목만 저장)
 const MAX_LOBBY_GALLERY = 60
 const MAX_LOBBY_MUSIC = 200
-const MAX_LOBBY_ICONS = 24
+const MAX_LOBBY_ICON_IMAGES = 24
+// 좌표·이모지·이름·크기·숨김은 아이콘 하나에 수십 바이트뿐이라 그림과 같은 상한을 쓸 이유가 없다.
+// 배치는 아이콘을 하나 옮기면 밀려난 것까지 전부 좌표를 갖게 되므로(겹침 방지), 아이콘 수만큼 항목이 찬다.
+// 본체 14개 + 확장팩 몇 개가 오늘의 최대지만, 확장팩이 늘어도 최근에 옮긴 자리부터 잘리지 않게 넉넉히 둔다.
+const MAX_LOBBY_ICON_ATTRS = 64
 const MAX_LOBBY_MEMO = 4000
 const MAX_LOBBY_DDAY = 40 // 디데이 카드 개수 상한
 const MAX_LOBBY_DDAY_TOTAL = 5_000_000 // 디데이 이미지 합계 상한(accounts.json 비대화·본문 한도 방지)
@@ -188,6 +279,11 @@ const MAX_LOBBY_CAL_TEXT = 200 // 일정 텍스트 길이 상한
 const MAX_LOBBY_STICKERS = 60 // 스티커 개수 상한
 const MAX_LOBBY_STICKER = 600_000 // 스티커 이미지 1개 상한
 const MAX_LOBBY_STICKER_TOTAL = 6_000_000 // 스티커 이미지 합계 상한(accounts.json 비대화·본문 한도 방지)
+const MAX_LOBBY_WIDGETS = 40 // 위젯 창 개수 상한(위젯 종류 수보다 넉넉히)
+const MAX_LOBBY_MUSIC_SRC = 40_000_000 // 음원 참조 1개 상한 — 'asset:<해시>' 면 74자, data URL 폴백만 커진다
+// 오디오 합계 상한. 참조로 올라오면 200곡이라도 15KB 남짓이라 걸리지 않고, data URL 폴백만 잘린다.
+// 계정 파일은 전 계정 공용 한 벌이라, 여기에 박힌 바이트는 이후 모든 저장에서 매번 다시 쓰인다.
+const MAX_LOBBY_MUSIC_SRC_TOTAL = 4_000_000
 
 /** 로비 스냅샷 정규화 — 색은 hex, 이미지는 data:image(길이 캡), 텍스트/개수 캡. CSS·저장 주입 방지. */
 /** 스냅샷에 실제로 실린 그림 수 — 통째로 빠진 사본이 멀쩡한 것을 덮지 않게 가르는 데 쓴다. */
@@ -225,11 +321,13 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
     for (const g of o.gallery as Record<string, unknown>[]) {
       if (gallery.length >= MAX_LOBBY_GALLERY) break
       if (!g || typeof g !== 'object') continue
+      const frame = lobbyImageFrame(g.frame)
       gallery.push({
         title: typeof g.title === 'string' ? g.title.slice(0, 60) : '',
         memo: typeof g.memo === 'string' ? g.memo.slice(0, 300) : '',
         colors: Array.isArray(g.colors) ? (g.colors as unknown[]).slice(0, 4).map((c) => hexColor(c) ?? '') : [],
-        image: lobbyImageRef(g.image, MAX_LOBBY_IMAGE)
+        image: lobbyImageRef(g.image, MAX_LOBBY_IMAGE),
+        ...(frame ? { frame } : {})
       })
     }
   }
@@ -251,7 +349,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconImages: Record<string, string> = {}
   if (o.iconImages && typeof o.iconImages === 'object') {
     for (const [k, val] of Object.entries(o.iconImages as Record<string, unknown>)) {
-      if (Object.keys(iconImages).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconImages).length >= MAX_LOBBY_ICON_IMAGES) break
       const img = lobbyImageRef(val, MAX_LOBBY_ICON)
       if (img) iconImages[k.slice(0, 40)] = img
     }
@@ -259,7 +357,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconPos: Record<string, { x: number; y: number }> = {}
   if (o.iconPos && typeof o.iconPos === 'object') {
     for (const [k, val] of Object.entries(o.iconPos as Record<string, unknown>)) {
-      if (Object.keys(iconPos).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconPos).length >= MAX_LOBBY_ICON_ATTRS) break
       const p = val as Record<string, unknown>
       if (p && typeof p.x === 'number' && typeof p.y === 'number' && isFinite(p.x) && isFinite(p.y)) {
         iconPos[k.slice(0, 40)] = { x: Math.round(p.x), y: Math.round(p.y) }
@@ -269,7 +367,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconEmojis: Record<string, string> = {}
   if (o.iconEmojis && typeof o.iconEmojis === 'object') {
     for (const [k, val] of Object.entries(o.iconEmojis as Record<string, unknown>)) {
-      if (Object.keys(iconEmojis).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconEmojis).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'string' && val.trim()) iconEmojis[k.slice(0, 40)] = val.slice(0, 16)
     }
   }
@@ -277,7 +375,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconLabels: Record<string, string> = {}
   if (o.iconLabels && typeof o.iconLabels === 'object') {
     for (const [k, val] of Object.entries(o.iconLabels as Record<string, unknown>)) {
-      if (Object.keys(iconLabels).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconLabels).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'string' && val.trim()) iconLabels[k.slice(0, 40)] = val.trim().slice(0, 24)
     }
   }
@@ -285,7 +383,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconSizes: Record<string, number> = {}
   if (o.iconSizes && typeof o.iconSizes === 'object') {
     for (const [k, val] of Object.entries(o.iconSizes as Record<string, unknown>)) {
-      if (Object.keys(iconSizes).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconSizes).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'number' && isFinite(val)) iconSizes[k.slice(0, 40)] = Math.min(72, Math.max(32, Math.round(val)))
     }
   }
@@ -293,7 +391,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const hiddenIcons: Record<string, boolean> = {}
   if (o.hiddenIcons && typeof o.hiddenIcons === 'object') {
     for (const [k, val] of Object.entries(o.hiddenIcons as Record<string, unknown>)) {
-      if (Object.keys(hiddenIcons).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(hiddenIcons).length >= MAX_LOBBY_ICON_ATTRS) break
       if (val === true) hiddenIcons[k.slice(0, 40)] = true
     }
   }
@@ -306,13 +404,15 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
       const image = lobbyImageRef(d.image, MAX_LOBBY_IMAGE)
       const keepImg = image && image.length <= ddayBudget
       if (keepImg) ddayBudget -= image!.length
+      const frame = lobbyImageFrame(d.frame)
       ddays.push({
         title: typeof d.title === 'string' ? d.title.slice(0, 60) : '',
         emoji: typeof d.emoji === 'string' ? d.emoji.slice(0, 8) : '',
         mode: d.mode === 'since' ? 'since' : 'until',
         // 날짜는 'YYYY-MM-DD' 만 허용(그 외는 빈 문자열 → 클라가 안전 처리).
         date: typeof d.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.date) ? d.date : '',
-        ...(keepImg ? { image } : {})
+        ...(keepImg ? { image } : {}),
+        ...(frame ? { frame } : {})
       })
     }
   }
@@ -328,7 +428,15 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
         if (!ev || typeof ev !== 'object') continue
         const text = typeof ev.text === 'string' ? ev.text.slice(0, MAX_LOBBY_CAL_TEXT) : ''
         if (!text.trim()) continue
-        list.push({ text, color: hexColor(ev.color) ?? '#5bbd7a' })
+        const rep = ev.repeat
+        list.push({
+          text,
+          color: hexColor(ev.color) ?? '#5bbd7a',
+          // 반복 주기·종료일 — 화이트리스트라 여기 없는 값은 조용히 사라진다(방문자 달력이 회차를 못 그린다).
+          repeat: rep === 'weekly' || rep === 'biweekly' || rep === 'monthly' || rep === 'yearly' ? rep : undefined,
+          repeatUntil:
+            typeof ev.repeatUntil === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ev.repeatUntil) ? ev.repeatUntil : undefined
+        })
       }
       if (list.length) calEvents[k] = list
     }
@@ -354,8 +462,27 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
         borderColor: hexColor(st.borderColor) ?? '#ffffff',
         borderWidth: stickerNum(st.borderWidth, 0, 40, 0),
         shadow: st.shadow !== false, // 기본 켬(명시적 false 일 때만 끔)
+        rot: stickerNum(st.rot, -180, 180, 0),
         image
       })
+    }
+  }
+  // 위젯 창 배치 — 숫자 clamp(화면 밖으로 달아나도 되살릴 수 있는 범위). 이미지가 없어 예산 영향 없음.
+  const widgets: Record<string, LobbyWin> = {}
+  if (o.widgets && typeof o.widgets === 'object') {
+    for (const [k, val] of Object.entries(o.widgets as Record<string, unknown>)) {
+      if (Object.keys(widgets).length >= MAX_LOBBY_WIDGETS) break
+      const w = val as Record<string, unknown>
+      if (!w || typeof w !== 'object') continue
+      widgets[k.slice(0, 40)] = {
+        open: w.open === true,
+        x: stickerNum(w.x, -4000, 20000, 0),
+        y: stickerNum(w.y, -4000, 20000, 0),
+        w: stickerNum(w.w, 0, 8000, 0),
+        h: stickerNum(w.h, 0, 8000, 0),
+        z: stickerNum(w.z, 0, 100000, 1),
+        min: w.min === true
+      }
     }
   }
   return {
@@ -373,8 +500,109 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
     iconSizes,
     hiddenIcons,
     stickers,
+    widgets,
     updatedAt: Date.now()
   }
+}
+
+/**
+ * 이 스냅샷이 '아무것도 없는 판'인가 — 자동 발행이 남의 화면에 보이던 로비를 지우는 것을 막는 판정.
+ * 위젯 배치는 보지 않는다. 새 기기는 기본 배치를 그대로 갖고 있어서, 그것까지 '내용'으로 치면
+ * 빈 웹 브라우저 하나가 그대로 서버 사본을 덮는다.
+ */
+function lobbySnapshotIsBlank(l: LobbySnapshot): boolean {
+  return (
+    countLobbyImages(l) === 0 &&
+    !(l.memoText ?? '').trim() &&
+    (l.gallery ?? []).length === 0 &&
+    (l.ddays ?? []).length === 0 &&
+    (l.stickers ?? []).length === 0 &&
+    (l.music ?? []).length === 0 &&
+    Object.keys(l.calEvents ?? {}).length === 0 &&
+    Object.keys(l.colors ?? {}).length === 0 &&
+    Object.keys(l.iconEmojis ?? {}).length === 0 &&
+    Object.keys(l.iconLabels ?? {}).length === 0 &&
+    Object.keys(l.iconSizes ?? {}).length === 0 &&
+    Object.keys(l.hiddenIcons ?? {}).length === 0 &&
+    Object.keys(l.iconPos ?? {}).length === 0 &&
+    // 창을 열어 둔 배치도 '꾸민 것'이다(클라 snapshotLooksBlank 와 같은 규칙).
+    // ⚠ 'session' 은 새 로비의 기본값이라 세지 않는다 — 세면 빈 로비가 빈 것이 아니게 되어
+    //   빈 스냅샷 자동 발행 차단이 뚫린다(남의 화면에서 로비가 지워진 것처럼 보인다).
+    !Object.entries(l.widgets ?? {}).some(([k, w]) => k !== 'session' && w?.open) &&
+    !(l.wallpaper?.color ?? '')
+  )
+}
+
+/** 로비 음악 보관함 정규화 — 오디오는 참조(또는 data URL) 1개당 상한, 개수는 공개 목록과 같은 캡. */
+function sanitizeLobbyMusic(v: unknown): LobbyMusicTrack[] | null {
+  if (!Array.isArray(v)) return null
+  const out: LobbyMusicTrack[] = []
+  let coverBudget = MAX_LOBBY_COVER_TOTAL
+  let srcBudget = MAX_LOBBY_MUSIC_SRC_TOTAL
+  for (const raw of v as Record<string, unknown>[]) {
+    if (out.length >= MAX_LOBBY_MUSIC) break
+    if (!raw || typeof raw !== 'object') continue
+    const src = lobbyImageRef(raw.src, MAX_LOBBY_MUSIC_SRC, true)
+    if (!src) continue // 오디오 없는 항목은 보관함에 둘 이유가 없다(제목만은 공개 스냅샷 music 이 담당)
+    // 합계 예산 — 참조('asset:<해시>')는 74자라 사실상 걸리지 않고, data URL 폴백만 걸린다.
+    // 이게 없으면 한 번의 요청으로 수십 MB 짜리 base64 오디오가 전 계정 공용 파일에 박히고,
+    // 그 뒤로는 계정 정보를 저장할 때마다 그만큼을 매번 다시 쓴다.
+    if (src.length > srcBudget) continue
+    srcBudget -= src.length
+    const title = typeof raw.title === 'string' ? raw.title.slice(0, 200) : ''
+    // ⚠ 여기는 필드를 하나씩 적어 새로 짓는 자리다. 안 적으면 조용히 사라진다(보관함에 올렸다 받는 순간).
+    const volume =
+      typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : undefined
+    const vol = volume === undefined ? {} : { volume }
+    const cover = lobbyImageRef(raw.cover, MAX_LOBBY_COVER)
+    if (cover && cover.length <= coverBudget) {
+      coverBudget -= cover.length
+      out.push({ title, cover, src, ...vol })
+    } else {
+      out.push({ title, src, ...vol })
+    }
+  }
+  return out
+}
+
+/** 세션 BGM 라이브러리 정규화 — 로비 음악과 같은 예산·상한을 쓴다(계정 파일이 통째로 커지는 것을 막는다). */
+function sanitizeBgmLibrary(v: unknown): BgmLibraryTrack[] | null {
+  if (!Array.isArray(v)) return null
+  const out: BgmLibraryTrack[] = []
+  let srcBudget = MAX_LOBBY_MUSIC_SRC_TOTAL
+  for (const raw of v as Record<string, unknown>[]) {
+    if (out.length >= MAX_LOBBY_MUSIC) break
+    if (!raw || typeof raw !== 'object') continue
+    const kind = raw.kind === 'youtube' ? 'youtube' : 'file'
+    // 유튜브는 영상 id 라 짧다 — 오디오 참조에만 합계 예산을 매긴다.
+    const src =
+      kind === 'youtube'
+        ? typeof raw.src === 'string' && raw.src.trim()
+          ? raw.src.trim().slice(0, 64)
+          : undefined
+        : lobbyImageRef(raw.src, MAX_LOBBY_MUSIC_SRC, true)
+    if (!src) continue
+    if (kind === 'file') {
+      if (src.length > srcBudget) continue
+      srcBudget -= src.length
+    }
+    const size = typeof raw.size === 'number' && Number.isFinite(raw.size) ? Math.max(0, Math.floor(raw.size)) : undefined
+    const volume = typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : undefined
+    const roomId = typeof raw.roomId === 'string' && raw.roomId ? raw.roomId.slice(0, 64) : undefined
+    const createdAt =
+      typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? Math.floor(raw.createdAt) : Date.now()
+    out.push({
+      title: typeof raw.title === 'string' ? raw.title.slice(0, 200) : '',
+      kind,
+      src,
+      loop: raw.loop === true,
+      ...(volume === undefined ? {} : { volume }),
+      ...(size === undefined ? {} : { size }),
+      ...(roomId === undefined ? {} : { roomId }),
+      createdAt
+    })
+  }
+  return out
 }
 
 export interface Account {
@@ -402,12 +630,21 @@ export interface Account {
   guestbook?: GuestbookEntry[]
   /** 공개(동기화)한 로비 꾸밈 스냅샷 — 타인 '로비 방문' 시 사용. */
   lobby?: LobbySnapshot
+  /** 로비 음악 보관함(오디오 참조 포함) — 본인 기기 사이에서만 오간다. 방문자 응답에는 절대 싣지 않는다. */
+  lobbyMusic?: LobbyMusicTrack[]
+  /** 세션 BGM 라이브러리 보관함 — 웹·프로그램이 같은 음원 목록을 보게 한다(본인만 조회). */
+  bgmLibrary?: BgmLibraryTrack[]
   /** 친구(상호 수락) userId 목록. */
   friends?: string[]
   /** 나에게 온 친구 신청(상대 userId). */
   friendReqIn?: string[]
   /** 내가 보낸 친구 신청(상대 userId). */
   friendReqOut?: string[]
+  /**
+   * 로비 비공개 — 켜면 친구(와 서버 관리자)만 이 계정의 로비·블로그·세션 로그·방명록·마이룸을 볼 수 있다.
+   * 미설정=공개. 친구를 끊으면 friends 에서 빠지는 순간 바로 닫히므로 별도 회수 절차가 없다.
+   */
+  lobbyPrivate?: boolean
   /** 수동 프레즌스 상태(미설정=online). invisible 은 재접속 후에도 유지.
    *  PublicAccount 에는 절대 싣지 않는다 — /home 등으로 새면 '오프라인 표시' 위장이 무력화된다. */
   status?: PresenceStatus
@@ -426,6 +663,8 @@ export interface PublicAccount {
   banner?: string
   links?: ProfileLink[]
   profileTheme?: ProfileTheme
+  /** 로비 비공개 여부 — 방문 화면이 자물쇠와 안내를 그리는 데 쓴다(숨길 값이 아니다). */
+  lobbyPrivate?: boolean
 }
 
 /** 프로필 편집 패치(부분 갱신). */
@@ -436,6 +675,7 @@ export interface ProfilePatch {
   banner?: string
   links?: ProfileLink[]
   profileTheme?: ProfileTheme
+  lobbyPrivate?: boolean
 }
 
 export type AuthResult =
@@ -443,7 +683,9 @@ export type AuthResult =
   | { ok: false; error: string }
 
 export type ProfileResult = { ok: true; account: PublicAccount } | { ok: false; error: string }
-export type GuestbookResult = { ok: true; guestbook: GuestbookEntry[] } | { ok: false; error: string }
+/** 방명록 조작 결과. guestbook 이 빠져 오면 '바뀐 것 없음'이라는 뜻이다 — 이미 지워진 글을 다시
+ *  지우라는 요청이 그렇다. 없는 글 번호로 남의 방명록을 읽어 가지 못하게, 그때는 목록을 싣지 않는다. */
+export type GuestbookResult = { ok: true; guestbook?: GuestbookEntry[] } | { ok: false; error: string }
 export type LobbyResult = { ok: true } | { ok: false; error: string }
 
 /** 친구 신청/수락/거절/끊기 결과. 성공 시 상대 id(targetId)·행위자 id(selfId, 본인 다른 기기 푸시용)·자동수락 여부. */
@@ -554,14 +796,29 @@ export interface AuthStore {
   removeFriend(token: string, userId: string): FriendResult
   /** 내 친구·받은신청·보낸신청 목록(요약). 온라인 표시는 relay 가 덧붙인다. */
   friendList(token: string): FriendListResult
+  /**
+   * 친구 목록 차례를 사람이 정한 대로 바꾼다.
+   * ⚠ 목록에 없는 id 는 버리고, 빠진 친구는 뒤에 붙인다. 차례를 바꾸려던 조작이
+   *   친구를 끊는 일이 되면 안 된다.
+   */
+  reorderFriends(token: string, ids: string[]): { ok: boolean; error?: string }
   /** 토큰 소유 계정의 프로필(닉네임·사진·소개) 부분 갱신. */
   updateProfile(token: string, patch: ProfilePatch): ProfileResult
   /** 수동 프레즌스 상태 저장(계정 영속). 무효 값/계정 없음이면 false. */
   setStatus(accountId: string, status: PresenceStatus): boolean
   /** 저장된 수동 프레즌스 상태(미설정=undefined=online). */
   getStatus(accountId: string): PresenceStatus | undefined
+  /**
+   * 이 사람의 로비(와 그 안의 블로그·세션 로그·방명록)를 볼 수 있는가.
+   *
+   * 공개 계정이면 누구나, 비공개 계정이면 본인·친구·서버 관리자만 통과한다. viewerId 가 null 이면
+   * 로그인하지 않은 열람자다. 판정 재료가 계정 레코드뿐이라 친구를 끊는 즉시 다음 요청부터 닫힌다.
+   */
+  canViewLobby(viewerId: string | null, ownerId: string): boolean
   /** 갠홈 둘러보기 — 전체 사용자 공개 요약(닉네임순). */
   listUsers(): UserSummary[]
+  /** 관리자 계정 id 목록 — 새 가입 알림처럼 '서버장에게만' 보내야 하는 곳에서 쓴다. */
+  adminIds(): string[]
   /** 타인/내 갠홈 보기 — 공개 프로필 + 방명록. 없는 id 면 null. */
   getHome(userId: string): HomeView | null
   /** 방명록 글 남기기 — 토큰 인증(작성자). 대상 홈에 추가 후 갱신된 방명록 반환. */
@@ -573,9 +830,17 @@ export interface AuthStore {
    * refCount 는 보내는 기기가 '가지고 있다고 아는 그림 수'다. 그림이 하나도 안 실린 사본이 왔는데
    * 그 기기가 그림을 가지고 있다고 말하면, 읽지 못했을 뿐이므로 덮지 않는다.
    */
-  setLobby(token: string, snapshot: unknown, refCount?: number): LobbyResult
+  setLobby(token: string, snapshot: unknown, refCount?: number, explicitEmpty?: boolean): LobbyResult
   /** 타인/내 로비 스냅샷 조회(공개). 없으면 null. */
   getLobby(userId: string): LobbySnapshot | null
+  /** 내 로비 음악 보관함 저장(오디오 참조 포함) — 토큰 인증. 손님 거부. */
+  setLobbyMusic(token: string, tracks: unknown, opts?: { explicitEmpty?: boolean }): LobbyResult
+  /** 내 로비 음악 보관함 조회 — 본인만(토큰). 인증 실패면 null(방문자에게는 열지 않는다). */
+  getLobbyMusic(token: string): LobbyMusicTrack[] | null
+  /** 세션 BGM 라이브러리 보관함 저장(본인만). 비우기는 사람이 직접 누른 경우만(explicitEmpty). */
+  setBgmLibrary(token: string, tracks: unknown, opts?: { explicitEmpty?: boolean }): LobbyResult
+  /** 세션 BGM 라이브러리 보관함 조회 — 본인만(토큰 없으면 null). */
+  getBgmLibrary(token: string): BgmLibraryTrack[] | null
   /** 전 계정(아바타·배너·로비 스냅샷 등)에서 참조 중인 'asset:<해시>' 수집(자산 GC 라이브 집합). */
   collectAssetRefs(into: Set<string>): void
   /** 진단/테스트용. */
@@ -589,6 +854,8 @@ const DEFAULT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** 로그인 레이트리밋 기본값 — 윈도 내 최대 실패 횟수 / 윈도 길이. */
 const DEFAULT_MAX_LOGIN_ATTEMPTS = 8
 const DEFAULT_LOGIN_WINDOW_MS = 5 * 60 * 1000
+/** 계정 하나가 동시에 들고 있을 수 있는 로그인 수(기기 수). 넘으면 오래 안 쓴 것부터 풀린다. */
+const MAX_SESSIONS_PER_ACCOUNT = 10
 
 interface Session {
   accountId: string
@@ -612,6 +879,8 @@ export function createAuthStore(opts?: {
   const dataDir = opts?.dataDir ?? join(process.cwd(), 'data')
   const accountsPath = join(dataDir, 'accounts.json')
   const configPath = join(dataDir, 'config.json')
+  // 로그인 세션 — 계정 파일과 같은 폴더에 둔다(⚠ 토큰 자체가 열쇠라 비밀번호 해시와 보호 범위를 맞춘다).
+  const sessionsPath = join(dataDir, 'sessions.json')
   const ttl = opts?.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
   const maxAttempts = opts?.maxLoginAttempts ?? DEFAULT_MAX_LOGIN_ATTEMPTS
   const windowMs = opts?.loginWindowMs ?? DEFAULT_LOGIN_WINDOW_MS
@@ -619,7 +888,7 @@ export function createAuthStore(opts?: {
 
   let accounts: Account[] = []
   let config: ConfigShape = {}
-  // 토큰 → 세션(계정 id + 만료시각). 인메모리(서버 재시작 시 휘발 = 전원 재로그인).
+  // 토큰 → 세션(계정 id + 만료시각). 파일로도 남긴다 — 아래 로드/저장 참고.
   const sessions = new Map<string, Session>()
   // 로그인 실패 추적(정규화 아이디 기준 슬라이딩 윈도). 브루트포스 완화.
   const loginAttempts = new Map<string, { count: number; resetAt: number }>()
@@ -631,12 +900,52 @@ export function createAuthStore(opts?: {
         if (Array.isArray(data.accounts)) accounts = data.accounts
       }
     } catch (e) {
-      console.error('[auth] accounts.json 로드 실패 — 빈 목록으로 시작:', e)
+      // 빈 목록으로 시작하면 다음 저장이 깨진 원본을 덮어쓴다 — 손대기 전에 사본을 남겨 되살릴 길을 열어 둔다.
+      let kept = ''
+      try {
+        if (existsSync(accountsPath)) {
+          const t = new Date()
+          const p = (n: number): string => String(n).padStart(2, '0')
+          const stamp = `${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}-${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}`
+          copyFileSync(accountsPath, `${accountsPath}.bad-${stamp}`)
+          kept = `accounts.json.bad-${stamp}`
+        }
+      } catch {
+        /* 사본조차 못 남기면 원본은 그대로 둔 채 진행 — 아래 로그가 유일한 단서가 된다 */
+      }
+      console.error(
+        `[auth] accounts.json 로드 실패. 빈 목록으로 시작합니다${kept ? ` (원본은 ${kept} 로 보존)` : ''}:`,
+        e
+      )
     }
     try {
       if (existsSync(configPath)) config = JSON.parse(readFileSync(configPath, 'utf8')) as ConfigShape
     } catch (e) {
       console.error('[auth] config.json 로드 실패:', e)
+    }
+    // 지난번에 켜져 있던 로그인들을 되살린다(만료된 것은 버린다).
+    try {
+      if (existsSync(sessionsPath)) {
+        const raw = JSON.parse(readFileSync(sessionsPath, 'utf8')) as unknown
+        const t = now()
+        if (Array.isArray(raw)) {
+          for (const e of raw) {
+            if (!Array.isArray(e) || typeof e[0] !== 'string') continue
+            const s = e[1] as Partial<Session> | undefined
+            if (!s || typeof s.accountId !== 'string' || typeof s.expiresAt !== 'number') continue
+            if (s.expiresAt > t) sessions.set(e[0], { accountId: s.accountId, expiresAt: s.expiresAt })
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[auth] sessions.json 로드 실패. 로그인 상태 없이 시작:', e)
+    }
+    // 지난 저장이 이름 바꾸기까지 못 간 임시본이 남아 있으면 지운다 — 토큰 목록이 파일로 굴러다니지 않게.
+    try {
+      const stale = sessionsPath + '.tmp'
+      if (existsSync(stale)) unlinkSync(stale)
+    } catch {
+      /* 잠겨 있으면 다음 저장이 덮어쓴다 */
     }
   }
 
@@ -650,6 +959,40 @@ export function createAuthStore(opts?: {
     } catch (e) {
       console.error('[auth] 계정 저장 실패:', e)
     }
+  }
+
+  /**
+   * 로그인 세션을 파일로 남긴다 — 서버가 다시 켜져도 붙어 있던 사람이 로그인 화면으로 튕기지 않게.
+   *
+   * 토큰이 메모리에만 있으면 서버가 한 번 내려갔다 오는 순간 모두의 토큰이 한꺼번에 무효가 되고, 클라는
+   * 그것을 '인증 필요'로 받아 조용히 로그아웃한다. 그래서 잠깐 끊겼다 붙는 일이 '전원 재로그인'이 된다 —
+   * 사고의 원인이 무엇이든 사람들이 겪는 무게가 여기서 갈린다. 파일로 남겨 두면 '잠깐 끊김'으로 끝난다.
+   */
+  let sessionSaveTimer: NodeJS.Timeout | null = null
+  function saveSessions(): void {
+    if (!persist) return
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer)
+      sessionSaveTimer = null
+    }
+    try {
+      mkdirSync(dataDir, { recursive: true })
+      const tmp = sessionsPath + '.tmp'
+      writeFileSync(tmp, JSON.stringify([...sessions]), 'utf8') // 원자적 쓰기(임시→rename)
+      renameSync(tmp, sessionsPath)
+    } catch (e) {
+      console.error('[auth] 세션 저장 실패:', e)
+    }
+  }
+  // 만료 연장은 요청마다 일어난다 — 그때마다 쓰면 디스크가 이벤트 루프를 잡는다. 몰아서 한 번만 쓴다.
+  // 늦게 써도 손해가 없다: 유효기간이 몇 초 덜 늘어난 채로 남을 뿐이고, 기간은 애초에 날 단위다.
+  function saveSessionsSoon(): void {
+    if (!persist || sessionSaveTimer) return
+    sessionSaveTimer = setTimeout(() => {
+      sessionSaveTimer = null
+      saveSessions()
+    }, 10_000)
+    sessionSaveTimer.unref() // 대기 중 저장이 프로세스 종료(테스트 러너 포함)를 붙잡지 않게
   }
 
   // 마지막 접속 기록 — 메모리는 즉시 갱신, 파일 쓰기는 전역 1회로 뭉친다(60초 트레일링).
@@ -677,13 +1020,29 @@ export function createAuthStore(opts?: {
     bio: a.bio,
     banner: a.banner,
     links: a.links,
-    profileTheme: a.profileTheme
+    profileTheme: a.profileTheme,
+    lobbyPrivate: a.lobbyPrivate
   })
   function issue(a: Account): string {
     const token = randomUUID() + randomUUID() // 불투명 토큰
     sessions.set(token, { accountId: a.id, expiresAt: now() + ttl })
     sweepSessions() // 만료 토큰 정리(로그인 빈도 = 드묾 → O(n) 허용)
+    trimSessions(a.id)
+    saveSessions() // 로그인은 드무니 바로 남긴다(직후 서버가 내려가도 다시 로그인하지 않게)
     return token
+  }
+  /**
+   * 한 계정이 들고 있는 로그인 수를 제한한다 — 오래된 것부터 놓아 준다.
+   *
+   * 로그인 때마다 새 열쇠가 하나씩 생기는데 예전에는 서버를 껐다 켜면 전부 사라졌다. 이제는 파일로
+   * 남으므로 유효기간(기본 30일) 동안 계속 쌓인다 — 로그인 한 번이 그때까지 쌓인 목록 전체를 다시
+   * 쓰는 일이 되어, 놔두면 로그인이 점점 무거워지고 안 쓰는 열쇠도 한 달씩 살아 있는다.
+   */
+  function trimSessions(accountId: string): void {
+    const mine = [...sessions].filter(([, s]) => s.accountId === accountId)
+    if (mine.length <= MAX_SESSIONS_PER_ACCOUNT) return
+    mine.sort((x, y) => x[1].expiresAt - y[1].expiresAt) // 만료가 가까운 것 = 오래 안 쓴 것
+    for (const [tok] of mine.slice(0, mine.length - MAX_SESSIONS_PER_ACCOUNT)) sessions.delete(tok)
   }
   /** 만료 세션 일괄 제거(메모리 바운드). */
   function sweepSessions(): void {
@@ -697,9 +1056,11 @@ export function createAuthStore(opts?: {
     if (!s) return null
     if (s.expiresAt <= now()) {
       sessions.delete(token)
+      saveSessionsSoon()
       return null
     }
     s.expiresAt = now() + ttl // 슬라이딩 — 활성 세션은 계속 연장
+    saveSessionsSoon()
     return s.accountId
   }
   const find = (username: string): Account | undefined => {
@@ -750,7 +1111,9 @@ export function createAuthStore(opts?: {
   /** id → 공개 요약(없으면 null). 친구 목록 응답용. */
   function summaryOf(id: string): UserSummary | null {
     const a = accounts.find((x) => x.id === id)
-    return a ? { id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar } : null
+    return a
+      ? { id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar, lobbyPrivate: a.lobbyPrivate }
+      : null
   }
 
   return {
@@ -808,6 +1171,7 @@ export function createAuthStore(opts?: {
 
     logout(token) {
       sessions.delete(token)
+      saveSessions() // 로그아웃은 바로 남긴다 — 되살아난 토큰으로 다시 들어가지지 않게
     },
 
     deleteAccount(token, password) {
@@ -823,6 +1187,7 @@ export function createAuthStore(opts?: {
       }
       accounts = accounts.filter((x) => x.id !== id)
       for (const [tok, s] of sessions) if (s.accountId === id) sessions.delete(tok) // 모든 세션 무효화
+      saveSessions()
       // 다른 사용자 홈에 이 사람이 남긴 방명록 글 제거(작성자 스냅샷이라 별도 정리 필요).
       for (const acc of accounts) {
         if (acc.guestbook?.some((e) => e.authorId === id)) {
@@ -860,6 +1225,7 @@ export function createAuthStore(opts?: {
       a.hash = hashPassword(pw, a.salt)
       // 지금 쓰는 세션만 남기고 나머지는 끊는다(다른 기기·다른 사람 로그아웃).
       for (const [tok, s] of sessions) if (s.accountId === id && tok !== token) sessions.delete(tok)
+      saveSessions()
       save()
       return { ok: true, accountId: id }
     },
@@ -912,6 +1278,7 @@ export function createAuthStore(opts?: {
           avatar: a.avatar,
           role: a.role,
           createdAt: a.createdAt,
+          lobbyPrivate: a.lobbyPrivate,
           lastSeenAt: a.lastSeenAt
         }))
         .sort((x, y) => x.createdAt - y.createdAt)
@@ -958,6 +1325,7 @@ export function createAuthStore(opts?: {
       if (a.role === 'admin') return { ok: false, error: '관리자 계정은 삭제할 수 없습니다.' }
       accounts = accounts.filter((x) => x.id !== userId)
       for (const [tok, s] of sessions) if (s.accountId === userId) sessions.delete(tok) // 세션 무효화
+      saveSessions()
       // 다른 사용자 홈에 이 사람이 남긴 방명록 글 제거(작성자 스냅샷이라 별도 정리 필요).
       for (const acc of accounts) {
         if (acc.guestbook?.some((e) => e.authorId === userId)) {
@@ -1053,6 +1421,28 @@ export function createAuthStore(opts?: {
       }
     },
 
+    reorderFriends(token, ids) {
+      const meId = accountIdForToken(token)
+      if (!meId) return { ok: false, error: '로그인이 필요합니다.' }
+      const me = accounts.find((x) => x.id === meId)
+      if (!me) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      const have = me.friends ?? []
+      const want = Array.isArray(ids) ? ids.filter((x) => typeof x === 'string') : []
+      const seen = new Set<string>()
+      const next: string[] = []
+      for (const id of want) {
+        if (have.includes(id) && !seen.has(id)) {
+          seen.add(id)
+          next.push(id)
+        }
+      }
+      // ⚠ 적히지 않은 친구는 원래 차례를 지키며 뒤에 붙인다(버리면 조용한 친구 끊기가 된다).
+      for (const id of have) if (!seen.has(id)) next.push(id)
+      me.friends = next
+      save()
+      return { ok: true }
+    },
+
     updateProfile(token, patch) {
       const id = accountIdForToken(token)
       if (!id) return { ok: false, error: '로그인이 필요합니다.' }
@@ -1066,6 +1456,8 @@ export function createAuthStore(opts?: {
       if (typeof patch?.banner === 'string') a.banner = patch.banner ? dataImageUrl(patch.banner, 1_200_000) : undefined
       if (Array.isArray(patch?.links)) a.links = sanitizeLinks(patch.links)
       if (patch?.profileTheme !== undefined) a.profileTheme = sanitizeTheme(patch.profileTheme)
+      // 기본값(공개)이면 필드 자체를 지운다 — accounts.json 이 전 계정에 false 를 싣고 다니지 않게.
+      if (typeof patch?.lobbyPrivate === 'boolean') a.lobbyPrivate = patch.lobbyPrivate || undefined
       save()
       return { ok: true, account: pub(a) }
     },
@@ -1086,9 +1478,31 @@ export function createAuthStore(opts?: {
       return accounts.find((x) => x.id === accountId)?.status
     },
 
+    adminIds() {
+      return accounts.filter((a) => a.role === 'admin').map((a) => a.id)
+    },
+
+    canViewLobby(viewerId, ownerId) {
+      const owner = accounts.find((x) => x.id === ownerId)
+      // 없는 사람은 잠글 것도 없다 — 여기서 막으면 탈퇴했거나 오타로 들어간 주소가 '비공개 계정'으로
+      // 안내되어, 그 사람이 있는데 나만 못 보는 것처럼 읽힌다. 통과시키면 뒤에서 제 몫의 '없음'이 나온다.
+      if (!owner) return true
+      if (!owner.lobbyPrivate) return true
+      if (!viewerId) return false
+      if (viewerId === ownerId) return true
+      if ((owner.friends ?? []).includes(viewerId)) return true
+      return accounts.find((x) => x.id === viewerId)?.role === 'admin'
+    },
+
     listUsers() {
       return accounts
-        .map((a) => ({ id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar }))
+        .map((a) => ({
+          id: a.id,
+          username: a.username,
+          nickname: a.nickname,
+          avatar: a.avatar,
+          lobbyPrivate: a.lobbyPrivate
+        }))
         .sort((x, y) => (x.nickname || x.username).localeCompare(y.nickname || y.username))
     },
 
@@ -1128,7 +1542,11 @@ export function createAuthStore(opts?: {
       if (!target) return { ok: false, error: '대상을 찾을 수 없습니다.' }
       const list = target.guestbook ?? []
       const entry = list.find((e) => e.id === entryId)
-      if (!entry) return { ok: true, guestbook: list } // 이미 없음 — 멱등
+      // 없는 글 번호를 대면 '이미 지워졌다'로 넘어가는 자리다. 예전에는 그러면서 방명록을 통째로
+      // 돌려줬는데, 그것이 곧 읽는 길이었다 — 아무 번호나 대면 남의 방명록이 전부 나왔다.
+      // 두 번 눌러도 오류가 안 나야 하는 것은 그대로 두고, 목록만 싣지 않는다(부르는 쪽은 안 온
+      // 목록을 '변화 없음'으로 읽는다).
+      if (!entry) return { ok: true }
       // 홈 주인(대상=요청자) 또는 작성자만 삭제 가능.
       if (requesterId !== target.id && requesterId !== entry.authorId) {
         return { ok: false, error: '삭제 권한이 없습니다.' }
@@ -1138,7 +1556,7 @@ export function createAuthStore(opts?: {
       return { ok: true, guestbook: target.guestbook }
     },
 
-    setLobby(token, snapshot, refCount) {
+    setLobby(token, snapshot, refCount, explicitEmpty) {
       const id = accountIdForToken(token)
       if (!id) return { ok: false, error: '로그인이 필요합니다.' }
       const a = accounts.find((x) => x.id === id)
@@ -1151,6 +1569,12 @@ export function createAuthStore(opts?: {
       if (a.lobby && countLobbyImages(a.lobby) > 0 && countLobbyImages(clean) === 0 && refCount !== 0) {
         return { ok: false, error: '그림이 빠진 로비로 덮을 수 없습니다. 그림이 제대로 보이는 기기에서 보내 주세요.' }
       }
+      // 내용이 하나도 없는 판이 왔다. 위 가드는 '그림이 있던 로비'만 지키므로, 글·디데이·일정만 있던
+      // 로비는 그대로 통과해 지워진다(막 로그인한 빈 기기가 5초 뒤 자동으로 올린다).
+      // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀을 때만(explicitEmpty) 비우기를 허용한다.
+      if (a.lobby && !lobbySnapshotIsBlank(a.lobby) && lobbySnapshotIsBlank(clean) && !explicitEmpty) {
+        return { ok: false, error: '내용이 비어 있는 로비로 덮을 수 없습니다. 비우려면 설정에서 직접 보내 주세요.' }
+      }
       a.lobby = clean
       save()
       return { ok: true }
@@ -1159,6 +1583,53 @@ export function createAuthStore(opts?: {
     getLobby(userId) {
       const a = accounts.find((x) => x.id === userId)
       return a?.lobby ?? null
+    },
+
+    setLobbyMusic(token, tracks, opts) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      if (a.role === 'guest') return { ok: false, error: '손님 계정은 로비를 꾸밀 수 없습니다.' }
+      const clean = sanitizeLobbyMusic(tracks)
+      if (!clean) return { ok: false, error: '잘못된 음악 목록입니다.' }
+      // 보관함을 통째로 비우는 요청은 목록이 있던 계정에서 막는다 — 음원이 아직 없는 기기(웹판 첫 로그인)가
+      // 목록만 보고 빈 배열을 올리면 다른 기기의 음원 사본까지 사라진다.
+      // 사람이 직접 '이 기기 것으로 맞추기'를 눌렀을 때만(explicitEmpty) 비우기를 허용한다 —
+      // 그 길이 없으면 한 번 올린 곡은 서버에서 영영 지울 수 없고, 지운 곡이 새 기기에서 되살아난다.
+      if (clean.length === 0 && (a.lobbyMusic?.length ?? 0) > 0 && !opts?.explicitEmpty) return { ok: true }
+      a.lobbyMusic = clean
+      save()
+      return { ok: true }
+    },
+
+    getLobbyMusic(token) {
+      const id = accountIdForToken(token)
+      if (!id) return null // 본인만 — 방문자에게 음원을 내주지 않는다
+      const a = accounts.find((x) => x.id === id)
+      return a?.lobbyMusic ?? []
+    },
+
+    setBgmLibrary(token, tracks, opts) {
+      const id = accountIdForToken(token)
+      if (!id) return { ok: false, error: '로그인이 필요합니다.' }
+      const a = accounts.find((x) => x.id === id)
+      if (!a) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      if (a.role === 'guest') return { ok: false, error: '손님 계정은 음원 보관함을 쓸 수 없습니다.' }
+      const clean = sanitizeBgmLibrary(tracks)
+      if (!clean) return { ok: false, error: '잘못된 음원 목록입니다.' }
+      // 로비 음악과 같은 방어 — 아직 목록을 못 받은 기기가 빈 배열을 올려 다른 기기의 음원을 지우지 못하게.
+      if (clean.length === 0 && (a.bgmLibrary?.length ?? 0) > 0 && !opts?.explicitEmpty) return { ok: true }
+      a.bgmLibrary = clean
+      save()
+      return { ok: true }
+    },
+
+    getBgmLibrary(token) {
+      const id = accountIdForToken(token)
+      if (!id) return null // 본인만 — 남의 음원을 내주지 않는다
+      const a = accounts.find((x) => x.id === id)
+      return a?.bgmLibrary ?? []
     },
 
     collectAssetRefs(into) {

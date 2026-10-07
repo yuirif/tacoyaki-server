@@ -21,17 +21,29 @@ const MAX_TAGS = 12
 const MAX_TAG = 30
 const MAX_CAST = 20
 const MAX_GALLERY = 60
+/** 링크 칸 하나에 담을 수 있는 주소 수와 각 칸의 길이. 프로필 링크와 같은 한도로 맞춘다. */
+const MAX_LINKS = 8
+const MAX_LINK_LABEL = 30
+const MAX_LINK_URL = 400
 const MAX_COMMENTS = 300
 const MAX_COMMENT = 2000
 const MAX_COMMENT_IMAGES = 4
 const MAX_POSTS_PER_BOARD = 5000
 const MAX_WARNINGS = 8
+/** 한 글이 실어 보낼 수 있는 양식 칸 이름 개수 — 게시판 양식 상한(MAX_FORM_FIELDS)과 같은 크기로 둔다. */
+const MAX_FORM_KEYS = 40
 const MAX_REPORTS = 1000
 const MAX_REPORT_DETAIL = 500
 /** 본문 캐시 상한 — 넘으면 오래 안 쓴 것부터 내보낸다(더러운 것은 먼저 저장). */
 const BODY_CACHE_MAX = 200
 /** 삭제 글 보관 기간. 이 안에는 되살릴 수 있다. */
 const TRASH_KEEP_MS = 30 * 24 * 60 * 60 * 1000
+
+/** 링크 칸의 한 줄 — 보일 이름과 주소. 화면은 이 짝을 그대로 <a> 로 그린다. */
+export interface FieldLink {
+  label: string
+  url: string
+}
 
 export type Visibility = 'all' | 'member' | 'secret'
 export type NoticeLevel = 0 | 1 | 2
@@ -162,6 +174,14 @@ export interface SaveInput {
   publishAt?: unknown
   charId?: unknown
   charName?: unknown
+  /** 게시판 양식에서 '본문(서식)' 으로 선언된 칸 이름들. 그 칸 값만 새니타이저를 통과시킨다. */
+  richFieldKeys?: unknown
+  /** 게시판 양식에서 '링크' 로 선언된 칸 이름들. 그 칸 값만 주소 짝의 목록으로 받는다. */
+  linkFieldKeys?: unknown
+  /** 게시판 양식의 첫 '태그' 칸 이름. 그 칸은 글의 태그 목록(tags)이 맡으므로 fields 에 남기지 않는다. */
+  tagsKey?: unknown
+  /** 게시판 양식이 지금 쓰는 칸 이름 전부. 양식에서 사라진 칸의 값을 걷는 데 쓴다. */
+  formKeys?: unknown
 }
 
 /** 게시판 삭제 시 소속 글을 어떻게 할지 — 부르는 쪽이 반드시 정한다. */
@@ -188,6 +208,11 @@ function line(v: unknown, max: number): string {
 function assetRef(v: unknown): string {
   return typeof v === 'string' && ASSET_RE.test(v.trim()) ? v.trim() : ''
 }
+/** 새니타이저를 통과한 본문에서 첫 그림의 자산 참조를 집는다(표지를 안 고른 글의 폴백). */
+function firstImageRef(html: string): string {
+  const m = /<img[^>]+src="(asset:[a-f0-9]{64})"/i.exec(html)
+  return m ? m[1] : ''
+}
 function num(v: unknown, lo: number, hi: number, def: number): number {
   if (typeof v !== 'number' || !Number.isFinite(v)) return def
   return Math.min(hi, Math.max(lo, Math.round(v)))
@@ -204,6 +229,11 @@ function strList(v: unknown, maxLen: number, maxItems: number): string[] {
     if (out.length >= maxItems) break
   }
   return out
+}
+/** 태그 칸에 남아 있던 값 — 이 칸이 글의 태그를 맡기 전에는 쉼표로 이은 한 줄로 담겼다. */
+function tagCell(v: unknown): unknown[] {
+  if (Array.isArray(v)) return v
+  return typeof v === 'string' ? v.split(',') : []
 }
 function assetList(v: unknown, maxItems: number): string[] {
   if (!Array.isArray(v)) return []
@@ -229,6 +259,29 @@ function normBgm(v: unknown): PostBgm | null {
     return YT_ID_RE.test(src) ? { kind: 'yt', src, loop, volume } : null
   }
   return null
+}
+/**
+ * 링크 칸 값 정규화. 주소는 http(s) 만 받는다 — 이 값은 화면에서 <a href> 로 그려지므로
+ * javascript: 같은 스킴이 그대로 들어가면 누르는 사람이 위험해진다.
+ */
+function normLinks(v: unknown): FieldLink[] {
+  if (!Array.isArray(v)) return []
+  const out: FieldLink[] = []
+  for (const raw of v) {
+    if (!raw || typeof raw !== 'object') continue
+    const o = raw as Record<string, unknown>
+    let url = line(o.url, MAX_LINK_URL)
+    if (!url) continue
+    if (!/^https?:\/\//i.test(url)) {
+      // 스킴을 안 적은 주소는 https 로 본다. 그 밖의 스킴은 아예 버린다.
+      if (/^[\w.-]+\.[a-z]{2,}/i.test(url)) url = 'https://' + url
+      else continue
+    }
+    const label = line(o.label, MAX_LINK_LABEL)
+    out.push({ label: label || url, url })
+    if (out.length >= MAX_LINKS) break
+  }
+  return out
 }
 function normRating(v: unknown): Rating {
   return v === 'r15' || v === 'r19' ? v : 'all'
@@ -269,6 +322,8 @@ export interface CommunityPostStore {
   remove(postId: string, actorId: string, now: number): Result<PostSummary>
   restore(postId: string, actorId: string, ownOnly: boolean): Result<PostSummary>
   trashList(): PostSummary[]
+  /** 삭제함 비우기 — 요약과 본문 파일을 함께 없앤다. 목록을 비우면 삭제함 전체. 돌이킬 수 없다. */
+  purgeTrash(postIds?: string[]): number
   /**
    * 게시판마다 가장 최근에 올라온 글의 시각.
    * 목록의 ●NEW 는 '내가 마지막으로 본 때'와 이 값을 견줘야 참말이 된다 —
@@ -278,6 +333,11 @@ export interface CommunityPostStore {
   purgeExpired(now: number): number
   setNotice(postId: string, level: NoticeLevel, noticeMax: number): Result<PostSummary>
   setStatus(postId: string, status: ThreadStatus): Result<PostSummary>
+  /**
+   * 글 하나를 다른 게시판으로 옮긴다(카테고리 변경). 옮긴 뒤의 요약을 돌려준다.
+   * 공지는 내려간다 — 게시판마다 공지 자리 수가 따로라, 옮긴 글이 남의 자리를 밀어낼 수 없다.
+   */
+  move(postId: string, toBoardId: string, now: number): Result<PostSummary>
   /** 글쓴이·운영진이 댓글을 닫거나 다시 연다. 달려 있던 댓글은 건드리지 않는다. */
   setCommentsClosed(postId: string, closed: boolean): Result<Post>
   like(postId: string, accountId: string): Result<{ liked: boolean; count: number }>
@@ -331,7 +391,7 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
         if (Array.isArray(d)) reports = d as Report[]
       }
     } catch (e) {
-      console.error('[community/post] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community/post] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
@@ -494,6 +554,8 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       // 수정 권한(내 글인지·남의 글도 되는지)은 라우트가 판정한다. 여기서는 작성자 정보를 덮어쓰지 않는 것만 지킨다.
       let doc = input.postId ? loadDoc(input.postId) : null
       if (input.postId && !doc) return { ok: false, error: '글을 찾을 수 없습니다.' }
+      // 임시저장이었다가 이번 저장으로 발행되는지 — 아래에서 draft 를 덮어쓰기 전에 봐 둔다.
+      const wasDraft = doc ? doc.post.draft : false
       if (!doc) {
         const b = idx(boardId)
         if (b.summaries.filter((s) => !s.deletedAt).length >= MAX_POSTS_PER_BOARD) {
@@ -542,11 +604,16 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
           }
 
       post.title = title
-      post.html = html
+      // 본문을 아예 안 실어 보낸 요청(메타만 고치는 저장)은 있던 본문을 지우지 않는다.
+      // 양식의 본문 칸 이름이 바뀌어 값이 비어 오는 경우가 여기 걸린다 — 안 거르면 전문이 통째로 날아간다.
+      if (typeof input.html === 'string') post.html = html
       post.prefix = line(input.prefix, 20)
       post.tags = strList(input.tags, MAX_TAG, MAX_TAGS)
       post.cast = strList(input.cast, 64, MAX_CAST)
-      post.cover = assetRef(input.cover)
+      // 표지를 안 골랐으면 본문·모음의 첫 그림을 대신 세운다 — 목록 타일이 빈칸으로 남지 않게.
+      // 단 '표지 없음'을 명시해 보냈으면(빈 문자열) 그 뜻을 지킨다 — 안 그러면 지운 표지가 곧바로 되살아난다.
+      const wantsCover = typeof input.cover === 'string' ? !!input.cover.trim() : true
+      post.cover = wantsCover ? assetRef(input.cover) || firstImageRef(post.html) || assetList(input.gallery, 1)[0] || '' : ''
       post.gallery = assetList(input.gallery, MAX_GALLERY)
       post.bgm = normBgm(input.bgm)
       post.hasBgm = !!post.bgm
@@ -559,16 +626,42 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       post.charId = line(input.charId, 64)
       post.charName = line(input.charName, 40)
       // 구조화 칸은 게시판 양식이 정하므로 여기서는 형태만 지킨다(문자열·문자열 배열·불리언·숫자).
-      post.fields = {}
+      // 보낸 칸만 덮어쓴다 — 통째로 비우면 양식에서 칸 이름이 바뀌었을 때 예전 값이 영영 사라진다.
+      const rich = new Set(strList(input.richFieldKeys, 40, MAX_FORM_KEYS))
+      const linkKeys = new Set(strList(input.linkFieldKeys, 40, MAX_FORM_KEYS))
+      // 다만 양식에서 아주 빠진 칸은 걷는다. 안 걷으면 화면에 안 보이는 값이 글에 영원히 쌓이고,
+      // 그 값이 붙잡은 그림도 자산 회수에서 살아남아 영영 안 지워진다.
+      const known = strList(input.formKeys, 40, MAX_FORM_KEYS)
+      if (known.length) {
+        const keep = new Set([...known, ...Object.keys(input.fields && typeof input.fields === 'object' ? input.fields : {})])
+        for (const k of Object.keys(post.fields)) if (!keep.has(k)) delete post.fields[k]
+      }
       if (input.fields && typeof input.fields === 'object') {
         for (const [k, v] of Object.entries(input.fields as Record<string, unknown>)) {
           const key = line(k, 40)
           if (!key) continue
-          if (typeof v === 'string') post.fields[key] = v.slice(0, 4000)
+          // 링크 칸은 이름·주소 짝의 목록이다. 주소는 여기서 한 번 거른다 — 화면은 이 값을 그대로 눌러 갈 자리로 그린다.
+          if (linkKeys.has(key)) {
+            post.fields[key] = normLinks(v)
+            continue
+          }
+          // 서식 칸은 본문과 같은 화이트리스트를 거쳐야 한다 — 이 값도 화면에서 HTML 로 그려진다.
+          if (typeof v === 'string') post.fields[key] = rich.has(key) ? sanitizePostHtml(v.slice(0, MAX_HTML)) : v.slice(0, 4000)
           else if (typeof v === 'number' || typeof v === 'boolean') post.fields[key] = v
           else if (Array.isArray(v)) post.fields[key] = v.slice(0, 60).map((x) => (typeof x === 'string' ? x.slice(0, 500) : '')).filter(Boolean)
         }
       }
+      // 양식의 첫 태그 칸은 글의 태그 목록이 맡는다 — 같은 값을 칸에도 남기면 글에 두 번 보이고,
+      // 예전 판에서 글씨로 저장된 값이 그 자리에 유령처럼 남는다.
+      const tagsKey = line(input.tagsKey, 40)
+      if (tagsKey) {
+        // 이 칸이 태그를 맡기 전에 쓴 글은 값이 아직 칸에 있다 — 지우기 전에 태그로 옮긴다.
+        if (!post.tags.length) post.tags = strList(tagCell(post.fields[tagsKey]), MAX_TAG, MAX_TAGS)
+        delete post.fields[tagsKey]
+      }
+      // 발행되는 순간이 글이 처음 목록에 서는 때다 — 담아 둔 시각이 남으면 목록·정렬이 전부
+      // createdAt 기준이라 새로 낸 글이 옛 날짜 자리로 밀려난다. 발행 글의 일반 재저장은 그대로.
+      if (wasDraft && !post.draft) post.createdAt = now
       post.updatedAt = now
       if (!doc) {
         doc = { post, comments: [], dirty: true, usedAt: Date.now() }
@@ -632,6 +725,33 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       return out.sort((a, b) => b.deletedAt - a.deletedAt)
     },
 
+    purgeTrash(postIds) {
+      // 지정한 것만 지운다. 빈 목록이 오면 삭제함에 있는 것 전부.
+      const only = postIds && postIds.length ? new Set(postIds) : null
+      let n = 0
+      for (const [bid, b] of boards) {
+        const keep: PostSummary[] = []
+        for (const s of b.summaries) {
+          if (s.deletedAt && (!only || only.has(s.id))) {
+            bodies.delete(s.id)
+            if (persist) {
+              try {
+                unlinkSync(join(postDir, `${s.id}.json`))
+              } catch {
+                /* 이미 없음 */
+              }
+            }
+            n++
+          } else keep.push(s)
+        }
+        if (keep.length !== b.summaries.length) {
+          b.summaries = keep
+          saveBoard(bid)
+        }
+      }
+      return n
+    },
+
     purgeExpired(now) {
       let n = 0
       for (const [bid, b] of boards) {
@@ -679,6 +799,36 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       doc.post.status = status
       doc.dirty = true
       syncSummary(doc)
+      savePost(postId)
+      return { ok: true, value: toSummary(doc.post) }
+    },
+
+    move(postId, toBoardId, now) {
+      const doc = loadDoc(postId)
+      if (!doc || doc.post.deletedAt) return { ok: false, error: '글을 찾을 수 없습니다.' }
+      const from = doc.post.boardId
+      if (!isEntityId(toBoardId)) return { ok: false, error: '게시판이 올바르지 않습니다.' }
+      if (from === toBoardId) return { ok: false, error: '이미 그 게시판에 있는 글입니다.' }
+      const dest = idx(toBoardId)
+      if (dest.summaries.filter((s) => !s.deletedAt).length >= MAX_POSTS_PER_BOARD) {
+        return { ok: false, error: `한 게시판에 글은 ${MAX_POSTS_PER_BOARD}개까지입니다.` }
+      }
+      // 공지는 게시판마다 자리 수가 따로다 — 옮기면서 남의 자리를 밀어내지 않도록 내려 둔다.
+      doc.post.notice = 0
+      doc.post.boardId = toBoardId
+      doc.post.updatedAt = now
+      doc.dirty = true
+      // 반드시 새 게시판에 먼저 넣고 옛 게시판에서 뺀다. 순서를 뒤집으면 그 사이에 자산 회수가 돌 때
+      // 이 글의 그림이 어느 색인에도 없어 고아로 잡혀 지워진다.
+      syncSummary(doc)
+      const old = boards.get(from)
+      if (old) {
+        const keep = old.summaries.filter((s) => s.id !== postId)
+        if (keep.length !== old.summaries.length) {
+          old.summaries = keep
+          markBoard(from)
+        }
+      }
       savePost(postId)
       return { ok: true, value: toSummary(doc.post) }
     },

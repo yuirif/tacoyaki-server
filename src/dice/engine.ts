@@ -8,8 +8,13 @@ export type RNG = () => number
 
 const defaultRng: RNG = Math.random
 
-/** 성공 단계 판정 (목표값=기능치, roll=1d100). */
-export function successLevel(roll: number, target: number): SuccessLevel {
+/**
+ * 성공 단계 판정 (목표값=기능치, roll=1d100).
+ * compare='gte' 는 '목표 이상이 성공'인 룰 — 아래 기본표는 '이하가 성공'이라 그대로 쓰면 결과가 뒤집힌다.
+ * 그 경우 성공·실패 둘로만 가른다(대성공·펌블은 룰마다 달라 함부로 정하지 않는다 · 클라 engine.ts 미러).
+ */
+export function successLevel(roll: number, target: number, compare?: 'lte' | 'gte'): SuccessLevel {
+  if (compare === 'gte') return roll >= target ? 'regular' : 'fail'
   if (roll === 1) return 'critical'
   const fumbleMin = target < 50 ? 96 : 100
   if (roll >= fumbleMin) return 'fumble'
@@ -32,6 +37,8 @@ export interface CheckOpts {
   command?: string
   push?: boolean // 밀어붙이기 재시도 굴림
   rng?: RNG
+  /** 성공 방향 — 'gte' 면 목표 이상이 성공(클라 engine.ts 미러). */
+  compare?: 'lte' | 'gte'
 }
 
 /**
@@ -59,10 +66,10 @@ export function rollCheck(target: number, opts: CheckOpts = {}): CheckResult {
   if (bonus > 0) roll = Math.min(...candidates)
   else if (bonus < 0) roll = Math.max(...candidates)
   else roll = candidates[0]
-  const level = successLevel(roll, target)
+  const level = successLevel(roll, target, opts.compare)
   return {
     kind: 'check',
-    command: opts.command ?? `CC<=${target}`,
+    command: opts.command ?? `CC${opts.compare === 'gte' ? '>=' : '<='}${target}`,
     roll,
     rolls: candidates.length > 1 ? candidates : undefined,
     target,
@@ -174,7 +181,7 @@ export interface SumOpts {
 /** 단순 합산 굴림 (피해/혼합 등) */
 export function rollSum(expr: string, opts: SumOpts = {}): SumResult {
   const { rolls, modifier, total } = rollExpr(expr, opts.rng ?? defaultRng)
-  return { kind: 'sum', command: opts.command ?? expr, rolls, modifier, total }
+  return { kind: 'sum', command: opts.command ?? expr, expr, rolls, modifier, total }
 }
 
 /**
@@ -201,17 +208,21 @@ export function resolveInlineRolls(text: string, rng: RNG = defaultRng): string 
 export interface SanOpts {
   rng?: RNG
   command?: string
+  /** 성공 방향 — 'gte' 면 목표 이상이 성공. */
+  compare?: 'lte' | 'gte'
 }
 
 /** 이성(SAN) 판정. lossExpr = "성공측/실패측" (예: "1/1d6") */
 export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): SanResult {
   const rng = opts.rng ?? defaultRng
   const roll = rollD100(rng)
-  const level = successLevel(roll, target)
-  const success = roll <= target || roll === 1
+  const level = successLevel(roll, target, opts.compare)
+  const success = opts.compare === 'gte' ? roll >= target : roll <= target || roll === 1
   const [sExpr, fExpr] = lossExpr.split('/')
   const expr = success ? sExpr : (fExpr ?? sExpr)
-  const loss = rollExpr(expr, rng).total
+  // 굴린 눈을 함께 남긴다 — 1d6 손실은 합계만 보면 무엇이 나왔는지 알 수 없다.
+  const lossRoll = rollExpr(expr, rng)
+  const loss = lossRoll.total
   return {
     kind: 'san',
     command: opts.command ?? `SC ${lossExpr}<=${target}`,
@@ -220,6 +231,7 @@ export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): S
     level,
     success,
     loss,
+    ...(lossRoll.rolls.length ? { lossRolls: lossRoll.rolls } : {}),
     lossExpr
   }
 }
@@ -235,6 +247,14 @@ const LEVEL_RANK: Record<SuccessLevel, number> = {
 }
 function isSuccessLevel(l: SuccessLevel): boolean {
   return l !== 'fail' && l !== 'fumble'
+}
+
+/**
+ * 이 룰에서 나올 수 있는 결과 라벨 전부 — 어느 라벨이 더 구체적인지 견주는 데 쓴다.
+ * (카드 이름 '대성공!' 이 '성공' 카드로도 읽히는 것을 가르기 위한 기준표.)
+ */
+export function allCardKeywords(): string[] {
+  return [...Object.values(SUCCESS_LABEL), '성공', '실패', '무승부']
 }
 
 /**
@@ -348,18 +368,31 @@ function balancedParens(t: string): boolean {
 
 /** 라벨 없는 명령 본문 파싱 — command 에는 라벨 포함 원문을 그대로 박제한다. */
 function parseBareCommand(s: string, command: string, rng: RNG): DiceResult | null {
-  let m = s.match(/^(?:SC|SAN)\s+([0-9d+\-/]+)\s*<=\s*(\d+)$/i)
-  if (m) return rollSan(parseInt(m[2], 10), m[1], { rng, command })
+  let m = s.match(/^(?:SC|SAN)\s+([0-9d+\-/]+)\s*(<=|>=)\s*(\d+)$/i)
+  if (m) return rollSan(parseInt(m[3], 10), m[1], { rng, command, compare: m[2] === '>=' ? 'gte' : 'lte' })
   // 대결: CBR(a,b) / 대결(a,b) / 대결 a vs b
   m = s.match(/^(?:CBR|대결)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$/i)
   if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command })
   m = s.match(/^대결\s+(\d+)\s+vs\s+(\d+)$/i)
   if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command })
   // 밀어붙이기: "밀어붙이기 CC<=N" / "push CC<=N"
-  m = s.match(/^(?:밀어붙이기|push)\s+(?:CC|1d100)\s*([+-]\d+)?\s*<=\s*(\d+)$/i)
-  if (m) return rollCheck(parseInt(m[2], 10), { bonus: m[1] ? parseInt(m[1], 10) : 0, push: true, rng, command })
-  m = s.match(/^(?:CC|1d100)\s*([+-]\d+)?\s*<=\s*(\d+)$/i)
-  if (m) return rollCheck(parseInt(m[2], 10), { bonus: m[1] ? parseInt(m[1], 10) : 0, rng, command })
+  m = s.match(/^(?:밀어붙이기|push)\s+(?:CC|1d100)\s*([+-]\d+)?\s*(<=|>=)\s*(\d+)$/i)
+  if (m)
+    return rollCheck(parseInt(m[3], 10), {
+      bonus: m[1] ? parseInt(m[1], 10) : 0,
+      push: true,
+      rng,
+      command,
+      compare: m[2] === '>=' ? 'gte' : 'lte'
+    })
+  m = s.match(/^(?:CC|1d100)\s*([+-]\d+)?\s*(<=|>=)\s*(\d+)$/i)
+  if (m)
+    return rollCheck(parseInt(m[3], 10), {
+      bonus: m[1] ? parseInt(m[1], 10) : 0,
+      rng,
+      command,
+      compare: m[2] === '>=' ? 'gte' : 'lte'
+    })
   // 합산 굴림 식: 안전 문자(숫자·d·키프드롭 kh/kl/dh/dl·+ - * / 괄호)로만 이뤄지고 주사위(NdM)를 포함.
   if (/d[1-9]/i.test(s) && /^[0-9dkhl+\-*/() ]+$/i.test(s)) return rollSum(s, { rng, command })
   return null

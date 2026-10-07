@@ -51,6 +51,8 @@ export interface DmStore {
   /** 한 사용자의 모든 1:1 대화 삭제(계정 탈퇴 연쇄) — 상대 쪽 파일에서도 제거. 삭제된 대화의 상대 id 목록 반환(상대에게 정리 신호용).
    *  그룹 대화는 건드리지 않는다(그룹 탈퇴는 leaveAllGroups — 잔존 멤버 대화 보존). */
   removeForUser(userId: string): string[]
+  /** 지금 메모리에 올려 둔 대화 수 — 축출이 실제로 도는지 확인하는 용도(진단·시험). */
+  cachedThreadCount(): number
 
   // ===== 그룹(단체) DM — threadId 기반. 1:1 pairKey 스킴과 별도 네임스페이스('g:'+threadId, groups/ 하위 파일). =====
   /** 그룹 생성 — creator 자동 포함·중복 제거. 총원 2~MAX_GROUP_MEMBERS 아니면 null. */
@@ -95,7 +97,12 @@ function isGroupKey(key: string): boolean {
   return key.startsWith('g:')
 }
 
-export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): DmStore {
+export function createDmStore(opts?: {
+  dataDir?: string
+  persist?: boolean
+  /** 읽어 둔 대화의 메모리 예산(바이트). 미지정 시 기본값 — 축출 동작을 시험할 때만 낮춰 쓴다. */
+  cacheBudgetBytes?: number
+}): DmStore {
   const persist = opts?.persist !== false
   const dataDir = opts?.dataDir ?? join(process.cwd(), 'data', 'dm')
   const groupsDir = join(dataDir, 'groups') // 그룹 파일 하위 디렉터리(1:1 파일명 파싱과 격리)
@@ -106,6 +113,63 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
   const groupMeta = new Map<string, DmGroupMeta>() // threadId → 그룹 메타(멤버·제목)
   const flushing = new Map<string, Promise<void>>() // key → 진행 중 플러시(직렬화)
   let indexed = false
+
+  // 읽어 둔 대화의 메모리 예산. 대화 목록을 한 번 여는 것만으로 그 사람의 모든 대화가 통째로 올라오고
+  // (list 가 대화마다 read 를 부른다) 내려놓는 자리가 없으면, 사람이 늘수록 서버가 계속 부풀다 호스팅에
+  // 통째로 끊긴다 — 그 순간 접속해 있던 사람이 전부 함께 튕긴다. 오래 안 쓴 대화부터 놓아 준다(파일이 원본).
+  const CACHE_BUDGET_BYTES = opts?.cacheBudgetBytes ?? 24 * 1024 * 1024
+  const sizes = new Map<string, number>() // key → 대략 바이트(본문 길이 합)
+  let cachedBytes = 0
+  /**
+   * 대화 하나가 차지하는 대략 크기(이름 + 본문 + 건당 고정 오버헤드).
+   * 이름 길이를 반드시 함께 센다 — 빈 대화를 0 으로 치면, 있지도 않은 상대와의 빈 대화를 긴 이름으로
+   * 잔뜩 만들어 두는 것만으로 예산에 한 번도 안 걸리고 서버 메모리를 채울 수 있다.
+   */
+  function measure(key: string, msgs: DmMessage[]): number {
+    let n = key.length * 2 + 200
+    for (const m of msgs) n += m.text.length * 2 + 160
+    return n
+  }
+  /** 캐시에 올리거나 갱신하면서 예산 장부를 맞춘다. 최근 쓴 것이 뒤로 가도록 다시 넣는다(LRU 순서). */
+  function keep(key: string, msgs: DmMessage[]): void {
+    const size = measure(key, msgs)
+    cachedBytes += size - (sizes.get(key) ?? 0)
+    sizes.set(key, size)
+    cache.delete(key)
+    cache.set(key, msgs)
+    evict()
+  }
+  /** 최근에 안 쓴 대화부터 예산 안으로 내려놓는다. 저장이 걸려 있는 대화는 건드리지 않는다. */
+  function evict(): void {
+    // ⚠ 파일에 안 남기는 모드에서는 캐시가 곧 원본이다 — 내려놓으면 되읽을 곳이 없어 대화가 그대로 사라진다.
+    if (!persist) return
+    if (cachedBytes <= CACHE_BUDGET_BYTES) return
+    const keys = [...cache.keys()]
+    // 맨 뒤(방금 쓴 것)는 남긴다 — 부르는 쪽이 바로 이어서 flush 하므로, 여기서 내리면 빈 대화가 저장된다.
+    for (let i = 0; i < keys.length - 1 && cachedBytes > CACHE_BUDGET_BYTES; i++) {
+      const key = keys[i]
+      // ⚠ 저장 대기 중인 대화를 내리면 flush 가 cache 를 다시 읽을 때 빈 대화를 쓴다(대화 통째 소실).
+      if (flushing.has(key)) continue
+      cache.delete(key)
+      cachedBytes -= sizes.get(key) ?? 0
+      sizes.delete(key)
+      // ⚠ 가린 기준(clearedCache)은 같이 내리지 않는다 — 멤버당 숫자 하나라 자리를 거의 안 쓰는 반면,
+      //   내려 두면 그것만 손대는 길(그룹 나가기)이 빈 값을 저장해 전원의 가린 기준을 지운다.
+    }
+  }
+  /** 캐시에서 완전히 뺀다(대화 삭제) — 예산 장부도 함께 정리. */
+  function forget(key: string): void {
+    cache.delete(key)
+    cachedBytes -= sizes.get(key) ?? 0
+    sizes.delete(key)
+  }
+  /** 방금 쓴 대화를 LRU 뒤로 — 읽기만 해도 최근 것으로 친다. */
+  function touch(key: string): void {
+    const hit = cache.get(key)
+    if (!hit) return
+    cache.delete(key)
+    cache.set(key, hit)
+  }
 
   function fileFor(key: string): string {
     return isGroupKey(key) ? join(groupsDir, key.slice(2) + '.json') : join(dataDir, key + '.json')
@@ -175,7 +239,10 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
   }
   function read(key: string): DmMessage[] {
     const hit = cache.get(key)
-    if (hit) return hit
+    if (hit) {
+      touch(key)
+      return hit
+    }
     let msgs: DmMessage[] = []
     let cleared: Record<string, number> = {}
     if (persist) {
@@ -189,8 +256,8 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
         /* 없음/손상 → 빈 대화 */
       }
     }
-    cache.set(key, msgs)
     if (!clearedCache.has(key)) clearedCache.set(key, cleared)
+    keep(key, msgs)
     return msgs
   }
   /** userId 의 가린 기준시각(없으면 0). read 로 로드 보장 후 조회. */
@@ -205,6 +272,10 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
     const next = prev
       .then(async () => {
         try {
+          // ⚠ 저장은 '지금 메모리에 있는 것'을 쓴다. 메모리에 없는 대화를 그대로 쓰면 빈 대화가 파일을
+          //   덮어 통째로 사라진다. 부르는 곳이 열한 군데라 하나만 빠뜨려도 그렇게 되므로, 마지막에
+          //   여기서 한 번 더 확인한다(이 시점의 key 는 flushing 에 잡혀 있어 다시 내려가지 않는다).
+          if (!cache.has(key)) read(key)
           await mkdir(isGroupKey(key) ? groupsDir : dataDir, { recursive: true })
           const tmp = fileFor(key) + '.tmp'
           const meta = isGroupKey(key) ? groupMeta.get(key.slice(2)) : undefined
@@ -225,12 +296,15 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       })
       .finally(() => {
         if (flushing.get(key) === next) flushing.delete(key)
+        // 저장이 끝나야 비로소 내려놓을 수 있는 대화다. 여기서 한 번 더 보지 않으면, 쓰기가 몰린 뒤
+        // 조용해진 서버는 예산을 넘긴 채로 다음 읽기가 올 때까지 계속 들고 있는다.
+        evict()
       })
     flushing.set(key, next)
   }
   /** 대화 파일·캐시·색인 통째로 제거(양쪽 모두 삭제했거나 계정 탈퇴 시 — 용량 회수). 삭제는 진행 중 플러시 뒤에 직렬화. */
   function dropThread(key: string): void {
-    cache.delete(key)
+    forget(key)
     clearedCache.delete(key)
     if (isGroupKey(key)) {
       // 그룹 — 메타의 멤버 색인에서 제거(잘못된 '__' 파싱으로 새지 않게 반드시 여기서 분기).
@@ -270,7 +344,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const msg: DmMessage = { id: randomUUID(), from, to, text: t, createdAt: Date.now() }
       msgs.push(msg)
       if (msgs.length > MAX_MESSAGES) msgs.splice(0, msgs.length - MAX_MESSAGES)
-      cache.set(key, msgs)
+      keep(key, msgs)
       indexPair(key)
       flush(key)
       return msg
@@ -313,7 +387,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const m = msgs.find((x) => x.id === msgId)
       if (!m || m.from !== from) return null // 본인 메시지만
       m.text = t
-      cache.set(key, msgs)
+      keep(key, msgs)
       flush(key)
       return m
     },
@@ -325,7 +399,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const i = msgs.findIndex((x) => x.id === msgId)
       if (i < 0 || msgs[i].from !== from) return false // 본인 메시지만
       msgs.splice(i, 1)
-      cache.set(key, msgs)
+      keep(key, msgs)
       flush(key)
       return true
     },
@@ -346,6 +420,9 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       if ((cleared[a] ?? 0) >= last && (cleared[b] ?? 0) >= last) dropThread(key)
       else flush(key)
       return true
+    },
+    cachedThreadCount() {
+      return cache.size
     },
     removeForUser(userId) {
       ensureIndex()
@@ -384,7 +461,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       }
       groupMeta.set(meta.threadId, meta)
       const key = gkey(meta.threadId)
-      cache.set(key, [])
+      keep(key, [])
       clearedCache.set(key, {})
       indexGroup(meta)
       flush(key)
@@ -407,7 +484,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const msg: DmMessage = { id: randomUUID(), from, to: '', text: t, createdAt: Date.now(), threadId }
       msgs.push(msg)
       if (msgs.length > MAX_MESSAGES) msgs.splice(0, msgs.length - MAX_MESSAGES)
-      cache.set(key, msgs)
+      keep(key, msgs)
       flush(key)
       return msg
     },
@@ -431,7 +508,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const m = msgs.find((x) => x.id === msgId)
       if (!m || m.from !== from) return null // 본인 메시지만
       m.text = t
-      cache.set(key, msgs)
+      keep(key, msgs)
       flush(key)
       return m
     },
@@ -444,7 +521,7 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       const i = msgs.findIndex((x) => x.id === msgId)
       if (i < 0 || msgs[i].from !== from) return false // 본인 메시지만
       msgs.splice(i, 1)
-      cache.set(key, msgs)
+      keep(key, msgs)
       flush(key)
       return true
     },
@@ -473,6 +550,10 @@ export function createDmStore(opts?: { dataDir?: string; persist?: boolean }): D
       if (!meta || !userId || !meta.members.includes(userId)) return { ok: false, deleted: false, remaining: [] }
       meta.members = meta.members.filter((m) => m !== userId)
       const key = gkey(threadId)
+      // ⚠ 대화를 먼저 올려 둔다 — 아래 flush 는 지금 메모리에 있는 것을 그대로 파일에 쓴다.
+      //   서버를 켠 직후나 오래 안 쓴 그룹은 메모리에 없어서, 안 올리고 저장하면 남은 사람들의 기록이
+      //   빈 대화로 덮여 통째로 사라진다(파일이 원본이라 되돌릴 수 없다). invite 도 같은 이유로 먼저 읽는다.
+      read(key)
       byUser.get(userId)?.delete(key)
       // 가림 기준도 제거 — 재초대되면 invite 가 그 시점 기준으로 다시 설정한다.
       const cleared = clearedCache.get(key)

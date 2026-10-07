@@ -450,7 +450,7 @@ export function createCommunityQuest(deps: CommunityQuestDeps): CommunityQuest {
               r.notified = true
               const best = r.result.map((x) => TIER_LABEL[x.tier]).join(' · ')
               // 파티도 한 건으로 묶어 알린다 — 사람 수만큼 종이 울리면 아무도 읽지 않는다.
-              notify(accountId, `${r.snapshot.name} 결과가 나왔습니다 — ${best}`, r.id)
+              notify(accountId, `${r.snapshot.name} 결과가 나왔습니다: ${best}`, r.id)
             }
             if (r.status === 'running') anyRunning = true
           }

@@ -26,7 +26,10 @@ const ALLOWED_TAGS = new Set([
   'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'a', 'img', 'hr', 'code', 'pre',
   // 위·아래 첨자와 형광 표시 — 편집기 툴바가 내는 서식.
   // font 는 넣지 않는다 — 색·크기를 속성으로 들고 오는데 속성은 전부 걷어내므로 빈 껍데기만 남는다.
-  'sub', 'sup', 'mark'
+  'sub', 'sup', 'mark',
+  // HTML 직접 입력이 들고 오는 짜임 태그 — 표·접기·설명 목록 같은 구조는 받아 준다.
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption',
+  'details', 'summary', 'figure', 'figcaption', 'dl', 'dt', 'dd', 'small', 'ins', 'del'
 ])
 // 여는~닫는 태그를 통째로 제거할 위험 요소(스크립트·스타일·삽입 프레임 등).
 const DROP_BLOCKS = [
@@ -36,13 +39,20 @@ const DROP_BLOCKS = [
 // 허용 인라인 style 속성 — 값에 url(/expression/주석/스킴 없을 때만(CSS 주입 차단).
 // width/max-width=본문 이미지 크기 조절, border-color=구분선(hr) 색,
 // margin/padding/border=들여쓰기(인용 블록), float/display=본문 이미지 정렬.
+// position·z-index·transform·pointer-events 는 계속 받지 않는다 — 본문 상자를 벗어나
+// 앱 화면을 덮는 길이라, 밖에서 만들어 온 HTML 이 요구해도 열지 않는다.
 const ALLOWED_STYLE_PROPS = new Set([
   'text-align', 'color', 'background-color', 'font-size', 'font-weight',
   'font-style', 'text-decoration', 'font-family', 'line-height', 'letter-spacing',
   'width', 'max-width', 'height', 'border-color', 'border-top-color',
   'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
   'padding', 'padding-left', 'text-indent', 'border', 'float', 'clear',
-  'display', 'vertical-align'
+  'display', 'vertical-align',
+  // 밖에서 만들어 온 꾸밈 HTML 이 흔히 쓰는 속성 — 값 검사(url·음수 여백 차단)는 그대로 지난다.
+  // background 는 단축형이지만 url( 이 값 검사에 걸리므로 단색·그라데이션만 남는다.
+  'border-radius', 'border-width', 'border-style', 'background', 'box-shadow', 'text-shadow',
+  'opacity', 'min-height', 'list-style-type', 'border-collapse', 'border-spacing', 'table-layout',
+  'white-space', 'text-transform', 'gap', 'flex-direction', 'justify-content', 'align-items', 'flex-wrap'
 ])
 /**
  * 음수를 받아서는 안 되는 속성 — 여백을 크게 음수로 주면 본문이 글 밖으로 삐져나가
@@ -50,10 +60,10 @@ const ALLOWED_STYLE_PROPS = new Set([
  */
 const NO_NEGATIVE_PROPS = new Set([
   'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
-  'padding', 'padding-left', 'text-indent', 'width', 'max-width', 'height', 'letter-spacing'
+  'padding', 'padding-left', 'text-indent', 'width', 'max-width', 'height', 'min-height', 'letter-spacing'
 ])
-/** display 는 이미지 정렬(가운데=block)에만 쓴다 — 그 밖의 값은 받지 않는다. */
-const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none'])
+/** display 는 이미지 정렬(가운데=block)과 상자 배치(flex·grid)까지만 — 그 밖의 값은 받지 않는다. */
+const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none', 'flex', 'inline-flex', 'grid'])
 
 /** 속성값 이스케이프(쌍따옴표 컨텍스트). */
 function escAttr(s: string): string {
@@ -86,11 +96,14 @@ function sanitizeStyle(v: string): string {
     const prop = decl.slice(0, idx).trim().toLowerCase()
     if (!ALLOWED_STYLE_PROPS.has(prop)) continue
     const value = decl.slice(idx + 1).trim()
+    // 백슬래시는 CSS 이스케이프(\75 rl( 처럼 url 을 풀어 쓰는 우회)의 입구다 — 정상 인라인 스타일에 쓸 일이 없으니 통째로 버린다.
+    if (value.includes('\\')) continue
     if (/url\s*\(|expression|javascript:|@import|\/\*|<|>/i.test(value)) continue
     // 음수 여백은 본문 밖으로 내용을 밀어 다른 화면을 덮는 데 쓰인다.
     if (NO_NEGATIVE_PROPS.has(prop) && /-\s*[\d.]/.test(value)) continue
     if (prop === 'display' && !DISPLAY_VALUES.has(value.toLowerCase())) continue
-    const clean = value.slice(0, 120).replace(/["']/g, '')
+    // 길이 캡은 그라데이션(색 나열이 길다)이 중간에 잘리지 않을 만큼만 — 무한정 받지는 않는다.
+    const clean = value.slice(0, 240).replace(/["']/g, '')
     if (clean) out.push(`${prop}: ${clean}`)
   }
   return out.join('; ')
@@ -114,12 +127,18 @@ function sanitizeAttrs(tag: string, raw: string): string {
       if (u) out.push(`src="${escAttr(u)}"`)
     } else if (tag === 'img' && attr === 'alt') {
       out.push(`alt="${escAttr(val.slice(0, 120))}"`)
+    } else if ((tag === 'td' || tag === 'th') && (attr === 'colspan' || attr === 'rowspan')) {
+      // 병합 칸 수는 정수 1~50 만 — 터무니없는 값으로 표를 화면 밖까지 늘리는 것을 막는다.
+      const n = Number(val.trim())
+      if (Number.isInteger(n) && n >= 1 && n <= 50) out.push(`${attr}="${n}"`)
     } else if (attr === 'style') {
       const s = sanitizeStyle(val)
       if (s) out.push(`style="${escAttr(s)}"`)
     }
     // 그 외 속성(class·id·data-*·target 등)은 전부 차단(주입 표면 최소화).
   }
+  // 값 없는 불리언 속성은 위 정규식(이름=값 꼴)에 잡히지 않는다 — details 의 open 만 따로 받는다.
+  if (tag === 'details' && /(?:^|\s)open(?:\s*=|\s|$)/i.test(raw)) out.push('open')
   return out.length ? ' ' + out.join(' ') : ''
 }
 
@@ -134,7 +153,13 @@ function escapeLooseLt(s: string): string {
   return s.replace(/</g, '&lt;')
 }
 
-/** 본문 HTML 을 화이트리스트로 정규화 — 저장 전 1회. 타인 열람용이라 저장형 XSS 의 유일한 차단막. */
+/**
+ * 본문 HTML 을 화이트리스트로 정규화 — 저장 전 1회. 타인 열람용이라 저장형 XSS 의 유일한 차단막.
+ *
+ * 클라이언트 src/renderer/src/lib/richSanitize.ts 에 이 함수의 사본이 있다 — 허용 목록을 포함해
+ * 한쪽을 고치면 반드시 함께 고칠 것. 보안 경계는 어디까지나 이쪽(서버)이고, 클라 사본은
+ * HTML 직접 입력을 편집 화면에 되넣기 전에 거르는 작성자 자신 보호용이다.
+ */
 export function sanitizePostHtml(input: unknown): string {
   if (typeof input !== 'string') return ''
   // 길이 제한은 '들어올 때' 한 번만 건다. 정규화가 끝난 뒤에 자르면 안전하게 재작성된 태그가
@@ -258,6 +283,8 @@ export interface PostStore {
   listFor(viewerId: string | null, targetId: string): { posts: PostSummary[]; boards: Board[] }
   /** 글 상세 — 비공개/임시저장은 작성자만. 권한 없으면 null. */
   get(viewerId: string | null, postId: string): { post: PostDetail; liked: boolean } | null
+  /** 이 글의 주인 계정 id — 글 자체를 내주기 전에 로비 열람 권한을 물어보는 데 쓴다. 없는 글이면 null. */
+  ownerOf(postId: string): string | null
   /** 작성/수정(작성자) — id 있고 소유면 수정, 아니면 새 글. */
   save(authorId: string, input: PostInput): PostSaveResult
   /** 글 삭제(작성자). 삭제했으면 true. */
@@ -328,7 +355,7 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
         if (data.boards && typeof data.boards === 'object') boards = data.boards
       }
     } catch (e) {
-      console.error('[posts] posts.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[posts] posts.json 로드 실패. 빈 목록으로 시작:', e)
     }
   }
 
@@ -399,6 +426,10 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       return { post: detail(p), liked: !!viewerId && p.likes.includes(viewerId) }
     },
 
+    ownerOf(postId) {
+      return findPost(postId)?.authorId ?? null
+    },
+
     save(authorId, input) {
       if (!authorId) return { ok: false, error: '로그인이 필요합니다.' }
       const title = typeof input.title === 'string' ? input.title.trim().slice(0, MAX_TITLE) : ''
@@ -421,6 +452,7 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
         const p = findPost(input.id)
         if (!p) return { ok: false, error: '글을 찾을 수 없습니다.' }
         if (p.authorId !== authorId) return { ok: false, error: '수정 권한이 없습니다.' }
+        const wasDraft = p.draft
         p.title = title
         p.html = html
         p.tags = tags
@@ -428,6 +460,9 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
         p.draft = draft
         p.cover = cover
         p.boardId = boardId
+        // 임시저장이 발행되는 순간이 글이 처음 목록에 서는 때다 — 담아 둔 시각을 그대로 두면
+        // 새로 낸 글이 목록에서 옛 날짜 자리로 밀려난다. 발행 글의 일반 재저장은 건드리지 않는다.
+        if (wasDraft && !draft) p.createdAt = now
         p.updatedAt = now
         save()
         return { ok: true, post: detail(p) }

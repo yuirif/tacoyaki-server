@@ -591,7 +591,7 @@ export function createCommunityGames(opts?: { dataDir?: string; persist?: boolea
         }
       }
     } catch (e) {
-      console.error('[community/games] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community/games] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

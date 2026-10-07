@@ -2,7 +2,7 @@
 // 글/댓글은 communityPost, 캐릭터는 communityChar 가 맡고, 이 파일은 그 둘이 기대는 '무엇을 할 수 있는가'를 정한다.
 //
 // 권한: 서버 계정 등급(auth 의 admin/member/guest)은 호스팅 용량 관리용 축이라 여기에 쓰지 않는다.
-//   커뮤니티는 자체 역할·멤버십 테이블을 갖고, 판정은 effective() 하나로만 한다(우회 경로를 만들지 않기 위해).
+//   커뮤니티는 자체 역할·멤버십 테이블을 갖고, 판정은 can() 하나로만 한다(우회 경로를 만들지 않기 위해).
 // 자산: 참조는 전부 이 파일이 상주로 들고 있는 구조(설정·게시판 목록) 안에만 둔다.
 //   지연 로드 파일에 참조가 숨으면 자산 GC 가 그것을 못 보고 이미지를 지운다.
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, appendFileSync, readdirSync, statSync } from 'node:fs'
@@ -174,13 +174,14 @@ export type FieldType =
   | 'image'
   | 'gallery'
   | 'tags'
+  | 'link'
   | 'bgm'
   | 'check'
   | 'confirm'
   | 'divider'
 const FIELD_TYPES: ReadonlySet<string> = new Set<FieldType>([
   'text', 'longtext', 'rich', 'number', 'select', 'multiselect',
-  'image', 'gallery', 'tags', 'bgm', 'check', 'confirm', 'divider'
+  'image', 'gallery', 'tags', 'link', 'bgm', 'check', 'confirm', 'divider'
 ])
 
 export interface FieldDef {
@@ -226,6 +227,8 @@ export interface MenuItem {
   order: number
   /** 바로가기가 가리키는 게시판. 붙박이 자리에서는 쓰지 않는다. */
   boardId: string
+  /** 좁은 화면 아래쪽 바로가기 줄에 세울지. 자리가 좁아 앞에서부터 MAX_QUICK 개까지만 선다. */
+  quick?: boolean
 }
 
 export interface Board {
@@ -241,6 +244,8 @@ export interface Board {
   hidden: boolean
   rolePerms: Record<string, PermPatch>
   prefixes: string[]
+  /** 목록·제목 앞에 [말머리] 를 찍을지. 꺼도 말머리로 거르는 것은 그대로 된다. */
+  showPrefix: boolean
   form: FieldDef[]
   listStyle: ListStyle
   noticeMax: number
@@ -380,6 +385,8 @@ const LABEL_KEYS = new Set<string>(Object.keys(DEFAULT_LABELS))
 
 export type Stage = 'prep' | 'open' | 'closed'
 export type JoinMode = 'open' | 'approval' | 'invite'
+/** 글을 누구까지 읽게 할지. member = 가입한 사람만, public = 로그인한 누구나. */
+export type ReadMode = 'member' | 'public'
 
 /**
  * 커뮤니티 성격.
@@ -428,6 +435,12 @@ export interface CommunitySettings {
   logo: string
   stage: Stage
   joinMode: JoinMode
+  /** 비멤버에게 글을 보여 줄지. 기본은 멤버만 — 열어 두는 것은 관리자가 뜻을 갖고 고르는 일이다. */
+  readMode: ReadMode
+  /** 홈에 펼 게시판. 비우면 맨 앞의 일반 게시판을 쓴다. */
+  homeBoardId: string
+  /** 홈 위쪽에 걸 인사말(줄바꿈만 살린 평문). */
+  homeIntro: string
   applyForm: FieldDef[]
   econ: EconSettings
   theme: CommunityTheme
@@ -692,12 +705,13 @@ export function normMenu(v: unknown, boardIds: Set<string>): MenuItem[] {
       icon: str(r.icon, 40),
       hidden: bool(r.hidden),
       order: out.length,
-      boardId
+      boardId,
+      quick: bool(r.quick)
     })
   }
   for (const b of MENU_BUILTINS) {
     if (seenBuiltin.has(b)) continue
-    out.push({ id: b, builtin: b, name: '', icon: '', hidden: false, order: out.length, boardId: '' })
+    out.push({ id: b, builtin: b, name: '', icon: '', hidden: false, order: out.length, boardId: '', quick: b === 'home' })
   }
   return out
 }
@@ -793,6 +807,7 @@ function makeBoard(categoryId: string, kind: BoardKind, name: string, order: num
     hidden: false,
     rolePerms: {},
     prefixes: [],
+    showPrefix: true,
     form: defaultForm(kind),
     listStyle: defaultListStyle(kind),
     noticeMax: 3,
@@ -836,11 +851,16 @@ export interface CommunityStore {
   join(accountId: string, nick: string, answers: Record<string, unknown>, now: number): Result<{ member: CommunityMember | null; application: JoinApplication | null }>
   applications(): JoinApplication[]
   decideApplication(actorId: string, appId: string, approve: boolean, note: string, now: number): Result<CommunityMember | null>
+  /** 심사 대기 중인 본인 신청 취소 — 멤버 자리와 신청서를 함께 걷어 다시 신청할 수 있게 한다. */
+  withdrawApplication(accountId: string): void
   setRole(actorId: string, actorTier: number, accountId: string, roleId: string, now: number): Result<CommunityMember>
   setMemberPerms(accountId: string, perms: unknown, boardPerms: unknown): Result<CommunityMember>
   sanction(actorId: string, actorTier: number, accountId: string, input: unknown, now: number): Result<CommunityMember>
   clearSanction(actorTier: number, accountId: string): Result<CommunityMember>
-  leave(accountId: string): void
+  /** 스스로 나가기. 마지막 관리자는 나갈 수 없다(운영할 사람이 없어진다). */
+  leave(accountId: string): Result<true>
+  /** 커뮤니티 안에서 쓰는 이름 바꾸기. */
+  setNick(accountId: string, nick: string, now: number): Result<CommunityMember>
 
   /** 커뮤니티 성격 전환(서버 주인 전용 — 검증은 라우트). 자료는 그대로 두고 화면·라우트 구성만 갈아탄다. */
   setMode(mode: unknown, now: number): Result<CommunitySettings>
@@ -915,7 +935,7 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       }
       auditCache = loadRecentAudit()
     } catch (e) {
-      console.error('[community] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
@@ -949,6 +969,10 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       logo: assetRef(r.logo),
       stage: r.stage === 'open' || r.stage === 'closed' ? r.stage : 'prep',
       joinMode: r.joinMode === 'approval' || r.joinMode === 'invite' ? r.joinMode : 'open',
+      // 값이 없는 저장본(이 설정이 생기기 전에 만들어진 커뮤니티)은 멤버 전용으로 올라온다.
+      readMode: r.readMode === 'public' ? 'public' : 'member',
+      homeBoardId: str(r.homeBoardId, 64),
+      homeIntro: multiline(r.homeIntro, MAX_DESC),
       applyForm: normFormFields(r.applyForm),
       econ: normEcon(r.econ),
       theme: normTheme(r.theme),
@@ -1068,8 +1092,9 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
     if (ctx.isAppAdmin) return true
     const m = ctx.member
     const board = ctx.board ?? null
-    // 2) 비멤버·심사 대기 — 공개 게시판을 읽는 것만.
-    if (!m) return perm === 'board.read' && !!board && !board.hidden
+    // 2) 비멤버·심사 대기 — 열람을 공개로 열어 둔 커뮤니티에서만, 숨기지 않은 게시판을 읽는 것까지.
+    //    이 한 줄이 비멤버 열람의 유일한 관문이라, 여기서 막으면 목록·본문·댓글·실시간 구독이 함께 닫힌다.
+    if (!m) return settings?.readMode === 'public' && perm === 'board.read' && !!board && !board.hidden
     // 3~4) 제재. 개별 허용이 남아 있어 글이 써지는 일이 없도록 오버라이드보다 위에 둔다.
     const sanc = activeSanction(m, ctx.now)
     if (sanc?.kind === 'ban') return false
@@ -1146,6 +1171,9 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
         stage: 'prep',
         // 승인제가 기본 — 문을 열어 두는 것은 관리자가 뜻을 갖고 고르는 일이다(운영 설정에서 바꾼다).
         joinMode: 'approval',
+        readMode: 'member',
+        homeBoardId: '',
+        homeIntro: '',
         applyForm: [],
         econ: { ...DEFAULT_ECON },
         theme: defaultTheme(),
@@ -1239,6 +1267,18 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
     },
 
     applications: () => apps.slice().sort((a, b) => b.createdAt - a.createdAt),
+
+    withdrawApplication(accountId) {
+      // 신청서를 남긴 채 멤버 자리만 지우면 '이미 신청서를 냈습니다' 로 다시 신청도 못 하고,
+      // 관리자가 승인해도 붙일 자리가 없어 아무 일도 안 일어난다. 둘을 같이 걷는다.
+      const before = apps.length
+      apps = apps.filter((a) => !(a.accountId === accountId && a.status === 'pending'))
+      if (apps.length !== before) saveAppsFile()
+      if (members[accountId]?.roleId === 'pending') {
+        delete members[accountId]
+        touchMembers(true)
+      }
+    },
 
     decideApplication(actorId, appId, approve, note, now) {
       const app = apps.find((a) => a.id === appId)
@@ -1346,14 +1386,29 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
     },
 
     leave(accountId) {
-      if (!members[accountId]) return
+      if (!members[accountId]) return { ok: false, error: '가입한 커뮤니티가 아닙니다.' }
       // 관리자가 사라지면 커뮤니티를 운영할 사람이 없어진다.
       if (members[accountId].roleId === 'owner') {
         const owners = Object.values(members).filter((x) => x.roleId === 'owner')
-        if (owners.length <= 1) return
+        if (owners.length <= 1) return { ok: false, error: '하나뿐인 관리자는 나갈 수 없습니다. 먼저 다른 사람에게 관리자를 넘겨 주세요.' }
       }
       delete members[accountId]
       touchMembers(true)
+      return { ok: true, value: true }
+    },
+
+    setNick(accountId, nick, now) {
+      const m = members[accountId]
+      if (!m) return { ok: false, error: '가입한 커뮤니티가 아닙니다.' }
+      const clean = str(nick, MAX_NICK)
+      if (!clean) return { ok: false, error: '이름을 입력해 주세요.' }
+      // 남의 이름과 겹치면 누가 쓴 글인지 알 수 없게 된다.
+      const taken = Object.values(members).some((x) => x.accountId !== accountId && x.nick === clean)
+      if (taken) return { ok: false, error: '이미 쓰고 있는 이름입니다.' }
+      m.nick = clean
+      m.stats.lastSeenAt = now
+      touchMembers(true)
+      return { ok: true, value: m }
     },
 
     setMode(mode, now) {
@@ -1377,6 +1432,9 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       if (r.logo !== undefined) settings.logo = assetRef(r.logo)
       if (r.stage === 'prep' || r.stage === 'open' || r.stage === 'closed') settings.stage = r.stage
       if (r.joinMode === 'open' || r.joinMode === 'approval' || r.joinMode === 'invite') settings.joinMode = r.joinMode
+      if (r.readMode === 'member' || r.readMode === 'public') settings.readMode = r.readMode
+      if (r.homeBoardId !== undefined) settings.homeBoardId = str(r.homeBoardId, 64)
+      if (r.homeIntro !== undefined) settings.homeIntro = multiline(r.homeIntro, MAX_DESC)
       if (r.applyForm !== undefined) settings.applyForm = normFormFields(r.applyForm)
       if (r.econ !== undefined) settings.econ = normEcon(r.econ)
       settings.updatedAt = now
@@ -1449,6 +1507,7 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
           hidden,
           rolePerms,
           prefixes,
+          showPrefix: bool(b.showPrefix, prev?.showPrefix ?? true),
           form: form.length ? form : defaultForm(kind),
           listStyle:
             typeof b.listStyle === 'string' && ['row', 'card', 'grid', 'inline'].includes(b.listStyle)
